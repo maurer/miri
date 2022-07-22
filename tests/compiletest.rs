@@ -42,7 +42,7 @@ fn run_tests(mode: Mode, path: &str, target: Option<String>) -> Result<()> {
     // If we're on linux, then build the shared object file for testing external C function calls.
     if cfg!(target_os = "linux") {
         let cc = option_env!("CC").unwrap_or("cc");
-        Command::new(cc)
+        let cc_output = Command::new(cc)
             .args([
                 "-shared",
                 "-o",
@@ -56,6 +56,9 @@ fn run_tests(mode: Mode, path: &str, target: Option<String>) -> Result<()> {
             ])
             .output()
             .expect("failed to generate shared object file for testing external C function calls");
+        if !cc_output.status.success() {
+            panic!("error in generating shared object file for testing external C function calls");
+        }
     }
 
     let skip_ui_checks = env::var_os("MIRI_SKIP_UI_CHECKS").is_some();
