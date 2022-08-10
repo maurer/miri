@@ -6,5 +6,6 @@ CODEABI_1.0 {
         *get_unsigned_int*; 
         *add_int16*;
         *add_short_to_long*;
+	*pointer_test*;
     local: *;
 };

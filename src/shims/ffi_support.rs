@@ -207,8 +207,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl: rustc_hir::Mutability::Mut} ) => {
                     match some_ty.kind() {
                         TyKind::Int(IntTy::I32) => {
-                            println!("REEEE ");
-                            // let x = call::<i32>(ptr, libffi_args.as_slice());
+                            let x = call::<*mut i32>(ptr, libffi_args.as_slice());
+                            unsafe {
+                                println!("deref pointer: {:?}", *x);
+                            }
+                            let test_ptr: Pointer<Option<AllocId>> = Pointer::from_addr(x as u64);
+                            println!("pointer: {:?}", test_ptr);
+                            // this.write_pointer(test_ptr, dest)?;
                             // this.write_int(x, dest)?;
                             return Ok(());
                         },

@@ -23,6 +23,7 @@ extern "C" {
     fn add_short_to_long(x: i16, y: i64) -> i64;
     fn get_unsigned_int() -> u32;
     fn printer();
+    fn pointer_test() -> *mut i32;
 }
 
 fn main() {
@@ -50,5 +51,8 @@ fn main() {
         let base_p: *const i32 = &base as *const i32;
         let base_pp: *const *const i32 = &base_p as *const *const i32;
         assert_eq!(double_deref(base_pp), 42);
+
+        let ptr = pointer_test();
+        println!("In Rust this pointer has value: {:?}", *ptr);
     }
 }

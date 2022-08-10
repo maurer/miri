@@ -29,3 +29,9 @@ short add_int16(short x) {
 long add_short_to_long(short x, long y) {
   return x + y;
 }
+
+int* pointer_test() {
+  int *point = malloc(sizeof(int)); 
+  *point=1;  
+  return point;
+}
