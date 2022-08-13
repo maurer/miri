@@ -2,8 +2,9 @@ use libffi::{high::call::*, low::CodePtr};
 use std::ops::Deref;
 
 use rustc_middle::ty::{IntTy, Ty, TypeAndMut, TyKind, UintTy};
+use rustc_middle::mir::Mutability;
 use rustc_span::Symbol;
-use rustc_target::abi::HasDataLayout;
+use rustc_target::abi::{HasDataLayout, Size, Align};
 
 use crate::*;
 
@@ -207,14 +208,24 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl: rustc_hir::Mutability::Mut} ) => {
                     match some_ty.kind() {
                         TyKind::Int(IntTy::I32) => {
-                            let x = call::<*mut i32>(ptr, libffi_args.as_slice());
+                            let raw_addr = call::<*mut i32>(ptr, libffi_args.as_slice());
                             unsafe {
-                                println!("deref pointer: {:?}", *x);
+                                println!("deref pointer: {:?}", *raw_addr);
                             }
-                            let test_ptr: Pointer<Option<AllocId>> = Pointer::from_addr(x as u64);
-                            println!("pointer: {:?}", test_ptr);
-                            // this.write_pointer(test_ptr, dest)?;
-                            // this.write_int(x, dest)?;
+                            // TODO! 
+                            let len = 1;
+                            let size = 1;
+                            let align = 1;
+                            let ptr = this.allocate_ptr_raw_addr(
+                                raw_addr as u64,
+                                len,
+                                Size::from_bytes(size),
+                                Align::from_bytes(align).unwrap(),
+                                Mutability::Mut,
+                                MiriMemoryKind::C.into(),
+                            );
+                            println!("pointer: {:?}", ptr);
+                            this.write_pointer(ptr, dest)?;
                             return Ok(());
                         },
                         _ => { }
