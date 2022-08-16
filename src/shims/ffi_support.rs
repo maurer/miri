@@ -213,18 +213,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                                 println!("deref pointer: {:?}", *raw_addr);
                             }
                             // TODO! 
-                            let len = 1;
-                            let size = 1;
+                            let len = std::mem::size_of::<i32>();
                             let align = 1;
                             let ptr = this.allocate_ptr_raw_addr(
                                 raw_addr as u64,
                                 len,
-                                Size::from_bytes(size),
                                 Align::from_bytes(align).unwrap(),
                                 Mutability::Mut,
                                 MiriMemoryKind::C.into(),
                             );
-                            println!("pointer: {:?}", ptr);
                             this.write_pointer(ptr, dest)?;
                             return Ok(());
                         },
