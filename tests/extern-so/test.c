@@ -4,6 +4,10 @@ int double_deref(const int **p) {
   return **p;
 }
 
+void deref_and_print(int *p) {
+  printf("deref in C has value: %d\n", *p);
+}
+
 int add_one_int(int x) {
   return 2 + x;
 }

@@ -1,6 +1,6 @@
 //@only-target-linux
 //@only-on-host
-//@compile-flags: -Zmiri-extern-so-file=tests/extern-so/libtestlib.so
+//@compile-flags: -Zmiri-ignore-leaks -Zmiri-extern-so-file=tests/extern-so/libtestlib.so
 
 extern "C" {
     fn double_deref(x: *const *const i32) -> i32;
@@ -24,6 +24,7 @@ extern "C" {
     fn get_unsigned_int() -> u32;
     fn printer();
     fn pointer_test() -> *mut i32;
+    fn deref_and_print(x: *mut i32);
 }
 
 fn main() {
@@ -54,5 +55,8 @@ fn main() {
 
         let ptr = pointer_test();
         println!("In Rust this pointer has value: {:?}", *ptr);
+        *ptr = 5;
+        println!("Now, in Rust this pointer has value: {:?}", *ptr);
+        deref_and_print(ptr);
     }
 }

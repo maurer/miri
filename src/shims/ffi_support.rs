@@ -209,9 +209,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     match some_ty.kind() {
                         TyKind::Int(IntTy::I32) => {
                             let raw_addr = call::<*mut i32>(ptr, libffi_args.as_slice());
-                            unsafe {
-                                println!("deref pointer: {:?}", *raw_addr);
-                            }
                             // TODO! 
                             let len = std::mem::size_of::<i32>();
                             let align = 1;

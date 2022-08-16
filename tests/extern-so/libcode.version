@@ -7,5 +7,6 @@ CODEABI_1.0 {
         *add_int16*;
         *add_short_to_long*;
 	*pointer_test*;
+	*deref_and_print*;
     local: *;
 };

@@ -1,2 +1,5 @@
+In Rust this pointer has value: 1
+Now, in Rust this pointer has value: 5
 printing from C
 printing from C
+deref in C has value: 5
