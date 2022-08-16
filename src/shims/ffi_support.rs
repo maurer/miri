@@ -210,10 +210,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         TyKind::Int(IntTy::I32) => {
                             let raw_addr = call::<*mut i32>(ptr, libffi_args.as_slice());
                             // TODO! 
-                            let len = std::mem::size_of::<i32>();
+                            let len = 1;
+                            let type_size = std::mem::size_of::<i32>();
                             let align = 1;
                             let ptr = this.allocate_ptr_raw_addr(
                                 raw_addr as u64,
+                                type_size,
                                 len,
                                 Align::from_bytes(align).unwrap(),
                                 Mutability::Mut,
