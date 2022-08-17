@@ -2,7 +2,6 @@ use libffi::{high::call::*, low::CodePtr};
 use std::ops::Deref;
 
 use rustc_middle::ty::{IntTy, Ty, TypeAndMut, TyKind, UintTy};
-use rustc_middle::mir::Mutability;
 use rustc_span::Symbol;
 use rustc_target::abi::Align;
 
@@ -206,8 +205,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     this.write_int(u64::try_from(x).unwrap(), dest)?;
                     return Ok(());
                 }
-                // mut pointers
-                TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl: rustc_hir::Mutability::Mut} ) => {
+                // pointers
+                TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl } ) => {
                     // FIXME! Eventually, don't just use a giant allocation for C pointers.
                     let len = Self::C_POINTER_DEFAULT_LEN;
                     let align = 1;
@@ -270,7 +269,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                             type_size,
                             len,
                             Align::from_bytes(align).unwrap(),
-                            Mutability::Mut,
+                            *mutbl,
                             MiriMemoryKind::C.into(),
                         );
                         this.write_pointer(ptr, dest)?;
