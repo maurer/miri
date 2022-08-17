@@ -47,3 +47,19 @@ int* array_pointer_test() {
     arr[i] = i;
   return arr;
 }
+
+void swap_double_ptrs(short **x, short **y) {
+  short temp = **x;
+  **x = **y;
+  **y = temp;
+}
+
+// examples of C writing values and pointers to Miri memory,
+// suggested by Ralf in
+// https://github.com/rust-lang/miri/issues/2365#issuecomment-1192512642
+
+void set(short *x, short val) { *x = val; }
+void set2(short **x, short val) { **x = val; }
+
+void setptr(short **x, short *val) { *x = val; }
+void setptr2(short ***x, short *val) { **x = val; }

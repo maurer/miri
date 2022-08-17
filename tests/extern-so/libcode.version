@@ -9,5 +9,7 @@ CODEABI_1.0 {
 	*pointer_test*;
 	*deref_and_print*;
 	*array_pointer_test*;
+	*set*;
+	*swap_double_ptrs*;
     local: *;
 };

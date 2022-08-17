@@ -26,6 +26,11 @@ extern "C" {
     fn pointer_test() -> *mut i32;
     fn deref_and_print(x: *mut i32);
     fn array_pointer_test() -> *mut i32;
+    fn swap_double_ptrs(x: *mut *mut i16, y: *mut *mut i16);
+    fn set(x: *mut i16, v: i16);
+    fn set2(x: *mut *mut i16, v: i16);
+    fn setptr(p: *mut *mut i16, x: *mut i16);
+//    fn setptr2(p: *mut *mut *mut i16, x: *mut i16);
 }
 
 fn main() {
@@ -49,24 +54,59 @@ fn main() {
         printer();
         printer();
 
+        // test double dereference
         let base: i32 = 42;
         let base_p: *const i32 = &base as *const i32;
         let base_pp: *const *const i32 = &base_p as *const *const i32;
         assert_eq!(double_deref(base_pp), 42);
 
+        // test return pointer to i32 from C, dereference, modify in Rust, and see changes in C
         let ptr = pointer_test();
         assert_eq!(*ptr, 1);
         *ptr = 5;
         assert_eq!(*ptr, 5);
         deref_and_print(ptr);
 
+        // test return pointer to array of i32 from C, and read part of the array as a slice
         let arr_ptr = array_pointer_test();
         let slice = std::slice::from_raw_parts(arr_ptr as *const i32, 3u64 as usize);
         assert_eq!(slice, [0, 1, 2]);
         assert_eq!(*arr_ptr, 0);
         assert_eq!(*arr_ptr.offset(1), 1);
 
-        libc::free(ptr as *mut _);
-        libc::free(arr_ptr as *mut _);
+        // test passing a Rust pointer to C and reassigning its value
+        let mut set_base: i16 = 1;
+        let mut set_base_p: *mut i16 = &mut set_base as *mut i16;
+        set(set_base_p, 3);
+        assert_eq!(set_base, 3);
+        assert_eq!(*set_base_p, 3);
+
+        // test passing a double pointer, double dereferencing in C and reassigning its value
+        let mut set_base_pp: *mut *mut i16 = &mut set_base_p as *mut *mut i16;
+        set2(set_base_pp, 8);
+        assert_eq!(*set_base_p, 8);
+        assert_eq!(**set_base_pp, 8);
+       
+        let mut new_base: i16 = 2;
+        let mut new_base_p: *mut i16 = &mut new_base as *mut i16;
+        let new_base_pp: *mut *mut i16 = &mut new_base_p as *mut *mut i16;
+        setptr(new_base_pp, set_base_p);
+        assert_eq!(new_base_p, set_base_p);
+
+        assert_eq!(**set_base_pp, set_base);
+        swap_double_ptrs(new_base_pp, set_base_pp);
+        assert_eq!(**new_base_pp, set_base);
+
+        assert_eq!(*new_base_p, 8);
+
+//        set(set_base_p, 4);
+//        let new_base_ppp: *mut *mut *mut i16 = &mut new_base_pp as *mut *mut *mut i16;
+//        setptr2(new_base_ppp, set_base_p);
+//        assert_eq!(*new_base_p, 4);
+
+        // avoid memory leaks
+//        libc::free(ptr as *mut _);
+ //       libc::free(arr_ptr as *mut _);
+   //     libc::free(new_base_p as *mut _);
     }
 }
