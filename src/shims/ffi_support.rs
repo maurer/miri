@@ -4,7 +4,7 @@ use std::ops::Deref;
 use rustc_middle::ty::{IntTy, Ty, TypeAndMut, TyKind, UintTy};
 use rustc_middle::mir::Mutability;
 use rustc_span::Symbol;
-use rustc_target::abi::{HasDataLayout, Size, Align};
+use rustc_target::abi::Align;
 
 use crate::*;
 
@@ -208,25 +208,73 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 }
                 // mut pointers
                 TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl: rustc_hir::Mutability::Mut} ) => {
-                    match some_ty.kind() {
-                        TyKind::Int(IntTy::I32) => {
-                            let raw_addr = call::<*mut i32>(ptr, libffi_args.as_slice());
-                            // TODO! 
-                            let len = Self::C_POINTER_DEFAULT_LEN;
-                            let type_size = std::mem::size_of::<i32>();
-                            let align = 1;
-                            let ptr = this.allocate_ptr_raw_addr(
-                                raw_addr as u64,
-                                type_size,
-                                len,
-                                Align::from_bytes(align).unwrap(),
-                                Mutability::Mut,
-                                MiriMemoryKind::C.into(),
-                            );
-                            this.write_pointer(ptr, dest)?;
-                            return Ok(());
-                        },
-                        _ => { }
+                    // FIXME! Eventually, don't just use a giant allocation for C pointers.
+                    let len = Self::C_POINTER_DEFAULT_LEN;
+                    let align = 1;
+                    if let Some((raw_addr, type_size)) = 
+                        match some_ty.kind() {
+                            TyKind::Int(IntTy::I8) => {
+                                let raw_addr = call::<*mut i8>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i8>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Int(IntTy::I16) => {
+                                let raw_addr = call::<*mut i16>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i16>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Int(IntTy::I32) => {
+                                let raw_addr = call::<*mut i32>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i32>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Int(IntTy::I64) => {
+                                let raw_addr = call::<*mut i64>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i64>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Int(IntTy::Isize) => {
+                                let raw_addr = call::<*mut isize>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<isize>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Uint(UintTy::U8) => {
+                                let raw_addr = call::<*mut u8>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u8>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Uint(UintTy::U16) => {
+                                let raw_addr = call::<*mut u16>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u16>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Uint(UintTy::U32) => {
+                                let raw_addr = call::<*mut u32>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u32>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Uint(UintTy::U64) => {
+                                let raw_addr = call::<*mut u64>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u64>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            TyKind::Uint(UintTy::Usize) => {
+                                let raw_addr = call::<*mut usize>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<usize>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            _ => { None }
+                        } {
+                        let ptr = this.allocate_ptr_raw_addr(
+                            raw_addr,
+                            type_size,
+                            len,
+                            Align::from_bytes(align).unwrap(),
+                            Mutability::Mut,
+                            MiriMemoryKind::C.into(),
+                        );
+                        this.write_pointer(ptr, dest)?;
+                        return Ok(());
                     }
                 }
                 // Functions with no declared return type (i.e., the default return)
