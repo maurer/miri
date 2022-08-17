@@ -1,6 +1,6 @@
 //@only-target-linux
 //@only-on-host
-//@compile-flags: -Zmiri-ignore-leaks -Zmiri-extern-so-file=tests/extern-so/libtestlib.so
+//@compile-flags: -Zmiri-extern-so-file=tests/extern-so/libtestlib.so
 
 extern "C" {
     fn double_deref(x: *const *const i32) -> i32;
@@ -65,5 +65,8 @@ fn main() {
         assert_eq!(slice, [0, 1, 2]);
         assert_eq!(*arr_ptr, 0);
         assert_eq!(*arr_ptr.offset(1), 1);
+
+        libc::free(ptr as *mut _);
+        libc::free(arr_ptr as *mut _);
     }
 }
