@@ -39,3 +39,11 @@ int* pointer_test() {
   *point=1;  
   return point;
 }
+
+int* array_pointer_test() {
+  const int COUNT = 3;
+  int *arr = malloc(COUNT*sizeof(int));
+  for(int i = 0; i < COUNT; ++i) 
+    arr[i] = i;
+  return arr;
+}

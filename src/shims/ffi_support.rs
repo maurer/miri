@@ -12,6 +12,8 @@ impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriEvalContext<'mi
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx> {
 
+    const C_POINTER_DEFAULT_LEN: usize = 1000;
+
     /// Extract the scalar value from the result of reading a scalar from the machine,
     /// and convert it to a `CArg`.
     fn scalar_to_carg(
@@ -210,7 +212,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         TyKind::Int(IntTy::I32) => {
                             let raw_addr = call::<*mut i32>(ptr, libffi_args.as_slice());
                             // TODO! 
-                            let len = 1;
+                            let len = Self::C_POINTER_DEFAULT_LEN;
                             let type_size = std::mem::size_of::<i32>();
                             let align = 1;
                             let ptr = this.allocate_ptr_raw_addr(

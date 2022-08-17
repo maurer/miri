@@ -25,6 +25,7 @@ extern "C" {
     fn printer();
     fn pointer_test() -> *mut i32;
     fn deref_and_print(x: *mut i32);
+    fn array_pointer_test() -> *mut i32;
 }
 
 fn main() {
@@ -54,9 +55,15 @@ fn main() {
         assert_eq!(double_deref(base_pp), 42);
 
         let ptr = pointer_test();
-        println!("In Rust this pointer has value: {:?}", *ptr);
+        assert_eq!(*ptr, 1);
         *ptr = 5;
-        println!("Now, in Rust this pointer has value: {:?}", *ptr);
+        assert_eq!(*ptr, 5);
         deref_and_print(ptr);
+
+        let arr_ptr = array_pointer_test();
+        let slice = std::slice::from_raw_parts(arr_ptr as *const i32, 3u64 as usize);
+        assert_eq!(slice, [0, 1, 2]);
+        assert_eq!(*arr_ptr, 0);
+        assert_eq!(*arr_ptr.offset(1), 1);
     }
 }

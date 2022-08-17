@@ -8,5 +8,6 @@ CODEABI_1.0 {
         *add_short_to_long*;
 	*pointer_test*;
 	*deref_and_print*;
+	*array_pointer_test*;
     local: *;
 };
