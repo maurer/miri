@@ -96,6 +96,11 @@ impl<'mir, 'tcx> GlobalStateInner {
         None
     }
 
+    pub fn is_exposed(ecx: &MiriEvalContext<'mir, 'tcx>, alloc_id: AllocId,) -> bool {
+        let global_state = ecx.machine.intptrcast.borrow();
+        global_state.exposed.contains(&alloc_id)
+    }
+
     pub fn expose_ptr(
         ecx: &mut MiriEvalContext<'mir, 'tcx>,
         alloc_id: AllocId,
@@ -109,6 +114,7 @@ impl<'mir, 'tcx> GlobalStateInner {
             if ecx.machine.stacked_borrows.is_some() {
                 ecx.expose_tag(alloc_id, sb)?;
             }
+            println!("HERE: {:?}", alloc_id);
         }
         Ok(())
     }

@@ -58,6 +58,8 @@ fn main() {
         let base: i32 = 42;
         let base_p: *const i32 = &base as *const i32;
         let base_pp: *const *const i32 = &base_p as *const *const i32;
+        //println!("rust double pointer: {:?}", base_pp as u64);
+        //println!("rust pointer: {:?}", base_p as u64);
         assert_eq!(double_deref(base_pp), 42);
 
         // test return pointer to i32 from C, dereference, modify in Rust, and see changes in C
@@ -90,8 +92,11 @@ fn main() {
         let mut new_base: i16 = 2;
         let mut new_base_p: *mut i16 = &mut new_base as *mut i16;
         let new_base_pp: *mut *mut i16 = &mut new_base_p as *mut *mut i16;
-        setptr(new_base_pp, set_base_p);
-        assert_eq!(new_base_p, set_base_p);
+        setptr(set_base_pp, new_base_p);
+        assert_eq!(**set_base_pp, new_base);
+        //setptr(new_base_pp, set_base_p);
+        //assert_eq!(new_base_p, set_base_p);
+        //assert_eq!(**new_base_pp, 8);
 
         assert_eq!(**set_base_pp, set_base);
         swap_double_ptrs(new_base_pp, set_base_pp);
