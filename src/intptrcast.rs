@@ -114,7 +114,6 @@ impl<'mir, 'tcx> GlobalStateInner {
             if ecx.machine.stacked_borrows.is_some() {
                 ecx.expose_tag(alloc_id, sb)?;
             }
-            println!("HERE: {:?}", alloc_id);
         }
         Ok(())
     }

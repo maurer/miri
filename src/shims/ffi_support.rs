@@ -60,32 +60,36 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl: some_mut } ) => {
                 match k {
                     ScalarMaybeUninit::Scalar(Scalar::Ptr(mut ptr, ofs)) => {
-                        // println!("gotta expose_ptr: {:?}", ptr);
-                        // // expose the pointer
-                        // // TODO! get rid of code duplication with Machine
-                        // match ptr.provenance {
-                        //     Provenance::Concrete { alloc_id, sb } => {
-                        //         intptrcast::GlobalStateInner::expose_ptr(cx, alloc_id, sb)?;
-                        //         // let layout = cx.layout_of(*arg_type)?;
-                        //         // println!("UGH: {:?}", ptr);
-                        //         // println!("REEE {:?}, {:?}", arg_type, k);
-                        //         // let imm = ImmTy::from_scalar(Scalar::Ptr(ptr, ofs), layout);
-                        //         // let place = cx.ref_to_mplace(&imm)?;
-                        //         ptr.provenance = Provenance::Wildcard;
-                        //         // println!("place: {:?}", place);
-                        //         // println!("layout before: {:?}", layout);
-                        //         // let new_place = place.map_provenance(|p| {
-                        //         //     p.map(|sub_p| { sub_p /*Provenance::Wildcard*/ })
-                        //         // });
-                        //         // let new_ptr = ImmTy::from_immediate(new_place.to_ref(cx), imm.layout);
-                        //         // println!("new pointer: {:?}", new_ptr);
-                        //         // println!("layout after: {:?}", layout);
-                        //         // let out = cx.write_scalar(Scalar::Ptr(ptr, ofs), &place.into());
-                        //         // println!("done retagging: {:?}", out);
-                        //         // out?;
-                        //     },
-                        //     Provenance::Wildcard => { }
-                        // }
+                        match ptr.provenance {
+                            Provenance::Concrete { alloc_id, sb } => {
+                                intptrcast::GlobalStateInner::expose_ptr(cx, alloc_id, sb)?;
+                            },
+                            Provenance::Wildcard => { }
+                        }
+                        // FIXME: something is wrong with this code, it's meant to just change 
+                        // the provenance of the current pointer to `Wildcard`...
+                        // but even just writing back the original place it breaks the pointers.
+                        // seems to be an issue with the layout, some sort of mixup between the 
+                        // pointer and pointee layouts. 
+                        // one clue is that double dereference runs but produces the wrong 
+                        // result when this code is here?
+                        // the logic here is inspired from the `retag_reference` function in 
+                        // the stacked borrows mod file.
+
+                        // let layout = cx.layout_of(*arg_type)?;
+                        // let ptr_place = MPlaceTy::from_aligned_ptr(ptr.into(), layout);
+
+                        // // // get the place the pointer is pointing to
+                        // let imm = ImmTy::from_immediate(k.into(), ptr_place.layout);
+                        // let place = cx.deref_operand(&imm.into())?;
+                        // let new_place = place;
+                        // // let new_place = place.map_provenance(|p| {
+                        // //     p.map(|sub_p| { Provenance::Wildcard })
+                        // // });
+                        // let new_imm = new_place.to_ref(cx);
+                        // let new_ptr = ImmTy::from_immediate(new_imm.into(), ptr_place.layout);
+                        // cx.write_immediate(*new_ptr, &ptr_place.into())?;
+                        
                         let qq = ptr.into_parts().1.bytes_usize();
                         match (some_ty.kind(), some_mut) {
                             // int
@@ -102,69 +106,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                                 return Ok(CArg::ConstPtrInt16(qq as *const i16));
                             },
                             (TyKind::Int(IntTy::I32), rustc_hir::Mutability::Mut) => {
-                                println!("gotta expose_ptr_mut: {:?}", ptr);
-                                // expose the pointer
-                                // TODO! get rid of code duplication with Machine
-                                match ptr.provenance {
-                                    Provenance::Concrete { alloc_id, sb } => {
-                                        intptrcast::GlobalStateInner::expose_ptr(cx, alloc_id, sb)?;
-                                        let layout = cx.layout_of(*arg_type)?;
-                                        // println!("UGH: {:?}", ptr);
-                                        // println!("REEE {:?}, {:?}", arg_type, k);
-                                        let imm = ImmTy::from_scalar(Scalar::Ptr(ptr, ofs), layout);
-                                        let place = cx.ref_to_mplace(&imm)?;
-                                        ptr.provenance = Provenance::Wildcard;
-                                        // println!("place: {:?}", place);
-                                        // println!("layout before: {:?}", layout);
-                                        // let new_place = place.map_provenance(|p| {
-                                        //     p.map(|sub_p| { sub_p /*Provenance::Wildcard*/ })
-                                        // });
-                                        // let new_ptr = ImmTy::from_immediate(new_place.to_ref(cx), imm.layout);
-                                        // println!("new pointer: {:?}", new_ptr);
-                                        // println!("layout after: {:?}", layout);
-                                        let out = cx.write_scalar(Scalar::Ptr(ptr, ofs), &place.into());
-                                        println!("done retagging: {:?}", out);
-                                        out?;
-                                    },
-                                    Provenance::Wildcard => { }
-                                }
                                 return Ok(CArg::MutPtrInt32(qq as *mut i32));
                             },
                             (TyKind::Int(IntTy::I32), rustc_hir::Mutability::Not) => {
-                                println!("gotta expose_ptr_const: {:?}", ptr);
-                                // expose the pointer
-                                // TODO! get rid of code duplication with Machine
-                                match ptr.provenance {
-                                    Provenance::Concrete { alloc_id, sb } => {
-                                        intptrcast::GlobalStateInner::expose_ptr(cx, alloc_id, sb)?;
-                                        let layout = cx.layout_of(*arg_type)?;
-                                        // println!("UGH: {:?}", ptr);
-                                        println!("REEE {:?}, {:?}", arg_type, k);
-                                        // let imm = ImmTy::from_scalar(Scalar::Ptr(ptr, ofs), layout);
-                                        let imm = ImmTy::from_immediate(k.into(), layout);
-                                        let place = cx.deref_operand(&imm.into())?;
-                                        let imm = ImmTy::from_immediate(k.into(), layout);
-                                        let val = cx.read_immediate(&imm.into())?;
-                                        // ptr.provenance = Provenance::Wildcard;
-                                        println!("place: {:?}", place);
-                                        println!("layout before: {:?}", layout);
-                                        println!("val: {:?}", val);
-                                        // let new_place = place.map_provenance(|p| {
-                                        //     p.map(|sub_p| { sub_p /*Provenance::Wildcard*/ })
-                                        // });
-                                        // let new_imm = new_place.to_ref(cx);
-                                        // println!("new place: {:?}", new_place);
-                                        // let new_ptr = ImmTy::from_immediate(new_imm.into(), place.layout);
-                                        // println!("new pointer: {:?}", new_ptr);
-                                        // println!("layout after: {:?}", layout);
-                                        // let out = cx.write_scalar(Scalar::Ptr(ptr, ofs), &place.into());
-                                        // let imm = ImmTy::from_immediate(k.into(), layout);
-                                        let out = cx.write_immediate(*val, &place.into());
-                                        println!("done retagging: {:?}", out);
-                                        out?;
-                                    },
-                                    Provenance::Wildcard => { }
-                                }
                                 return Ok(CArg::ConstPtrInt32(qq as *const i32));
                             },
                             (TyKind::Int(IntTy::I64), rustc_hir::Mutability::Mut) => {
@@ -200,8 +144,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                             },
                             // recursive case
                             (TyKind::RawPtr(..), _) => {
-                                // let k_updated_prov = ScalarMaybeUninit::Scalar(Scalar::Ptr(ptr, ofs));
-                                return Ok(CArg::RecCarg(Box::new(Self::scalar_to_carg(k, some_ty, cx)?)));
+                                return Ok(CArg::RecCarg(Box::new(Self::scalar_to_carg(k.into(), some_ty, cx)?)));
                             }
                             _ => {}
                         }
@@ -362,7 +305,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         );
                         match ptr.provenance {
                             Provenance::Concrete { alloc_id, sb } => {
-                                println!("bruh: {:?}", alloc_id);
                                 intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, sb)?;
                                 ptr.provenance = Provenance::Wildcard;
                             }
