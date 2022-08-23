@@ -74,6 +74,10 @@ fn main() {
         assert_eq!(*arr_ptr, 0);
         assert_eq!(*arr_ptr.offset(1), 1);
 
+        // mutate the pointer and see it reflected in the slice
+        *arr_ptr.offset(1) = 5;
+        assert_eq!(slice, [0, 5, 2]);
+
         // test passing a Rust pointer to C and reassigning its value
         let mut set_base: i16 = 1;
         let mut set_base_p: *mut i16 = &mut set_base as *mut i16;
@@ -108,7 +112,7 @@ fn main() {
 		 * 
          * Tests for C writing _pointers_ to Miri memory.
          * These are not fully supported yet. The calls to C are allowed, but after the pointers
-         * are modified by C dereferencing them in Rust crashes Miri (with a UB error, stating
+         * are modified by C dereferencing them to a value in Rust crashes Miri (with a UB error, stating
          * that the memory access is invalid).
          * The lines that crash the code are commented out below -- uncomment to see the error.
          */
