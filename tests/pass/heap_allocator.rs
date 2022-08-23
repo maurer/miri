@@ -118,10 +118,10 @@ fn box_to_global() {
 }
 
 fn main() {
-//    check_alloc(System);
-//    check_alloc(Global);
-    // check_align_requests(System);
-    // check_align_requests(Global);
+    check_alloc(System);
+    check_alloc(Global);
+    check_align_requests(System);
+    check_align_requests(Global);
     global_to_box();
     box_to_global();
 }

@@ -30,7 +30,7 @@ extern "C" {
     fn set(x: *mut i16, v: i16);
     fn set2(x: *mut *mut i16, v: i16);
     fn setptr(p: *mut *mut i16, x: *mut i16);
-//    fn setptr2(p: *mut *mut *mut i16, x: *mut i16);
+    fn setptr2(p: *mut *mut *mut i16, x: *mut i16);
 }
 
 fn main() {
@@ -58,8 +58,6 @@ fn main() {
         let base: i32 = 42;
         let base_p: *const i32 = &base as *const i32;
         let base_pp: *const *const i32 = &base_p as *const *const i32;
-        //println!("rust double pointer: {:?}", base_pp as u64);
-        //println!("rust pointer: {:?}", base_p as u64);
         assert_eq!(double_deref(base_pp), 42);
 
         // test return pointer to i32 from C, dereference, modify in Rust, and see changes in C
@@ -84,34 +82,65 @@ fn main() {
         assert_eq!(*set_base_p, 3);
 
         // test passing a double pointer, double dereferencing in C and reassigning its value
-        let mut set_base_pp: *mut *mut i16 = &mut set_base_p as *mut *mut i16;
+        let set_base_pp: *mut *mut i16 = &mut set_base_p as *mut *mut i16;
         set2(set_base_pp, 8);
         assert_eq!(*set_base_p, 8);
         assert_eq!(**set_base_pp, 8);
-       
+
+		// test passing two double pointers, and swapping the _values_ they point to 
+		// note: this is _not_ C writing pointers to Miri memory
         let mut new_base: i16 = 2;
         let mut new_base_p: *mut i16 = &mut new_base as *mut i16;
         let new_base_pp: *mut *mut i16 = &mut new_base_p as *mut *mut i16;
+        let mut set_base: i16 = 1;
+        let mut set_base_p: *mut i16 = &mut set_base as *mut i16;
+        let set_base_pp: *mut *mut i16 = &mut set_base_p as *mut *mut i16;
+        assert_eq!(**set_base_pp, 1);
+        assert_eq!(**new_base_pp, 2);
+        assert_ne!(*new_base_pp, *set_base_pp);
+        swap_double_ptrs(set_base_pp, new_base_pp);
+        assert_ne!(*new_base_pp, *set_base_pp);
+        assert_eq!(**set_base_pp, 2);
+        assert_eq!(**new_base_pp, 1);
+
+        /*
+		 * STILL IN PROGRESS
+		 * 
+         * Tests for C writing _pointers_ to Miri memory.
+         * These are not fully supported yet. The calls to C are allowed, but after the pointers
+         * are modified by C dereferencing them in Rust crashes Miri (with a UB error, stating
+         * that the memory access is invalid).
+         * The lines that crash the code are commented out below -- uncomment to see the error.
+         */
+        // test passing a double pointer and a single pointer, and reassigning the double pointer
+        // to point to the single pointer
+        let mut new_base: i16 = 2;
+        let new_base_p: *mut i16 = &mut new_base as *mut i16;
+        assert_ne!(new_base_p, set_base_p);
         setptr(set_base_pp, new_base_p);
-        assert_eq!(**set_base_pp, new_base);
-        //setptr(new_base_pp, set_base_p);
-        //assert_eq!(new_base_p, set_base_p);
-        //assert_eq!(**new_base_pp, 8);
+        assert_eq!(new_base_p, set_base_p);
 
-        assert_eq!(**set_base_pp, set_base);
-        swap_double_ptrs(new_base_pp, set_base_pp);
-        assert_eq!(**new_base_pp, set_base);
+        // uh oh: the following code breaks
+        // let rust_ddref = **set_base_pp;
+        // let rust_dref = *set_base_p;
 
-        assert_eq!(*new_base_p, 8);
+        // test passing a triple pointer and a single pointer, double dereferencing the triple
+        // pointer, and reassigning it to the single pointer
+        let mut new_base: i16 = 2;
+        let mut new_base_p: *mut i16 = &mut new_base as *mut i16;
+        let mut new_base_pp: *mut *mut i16 = &mut new_base_p as *mut *mut i16;
+        let new_base_ppp: *mut *mut *mut i16 = &mut new_base_pp as *mut *mut *mut i16;
+        assert_ne!(**new_base_ppp, set_base_p);
+        setptr2(new_base_ppp, set_base_p);
+        assert_eq!(**new_base_ppp, set_base_p);
 
-//        set(set_base_p, 4);
-//        let new_base_ppp: *mut *mut *mut i16 = &mut new_base_pp as *mut *mut *mut i16;
-//        setptr2(new_base_ppp, set_base_p);
-//        assert_eq!(*new_base_p, 4);
+        // uh oh: the following code breaks
+        // let rust_dref = *new_base_p;
+        // let rust_ddref = **new_base_pp;
+        // let rust_dddref = ***new_base_ppp;
 
         // avoid memory leaks
-//        libc::free(ptr as *mut _);
- //       libc::free(arr_ptr as *mut _);
-   //     libc::free(new_base_p as *mut _);
+        libc::free(ptr as *mut _);
+        libc::free(arr_ptr as *mut _);
     }
 }

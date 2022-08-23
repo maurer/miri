@@ -2,6 +2,7 @@ use libffi::{high::call::*, low::CodePtr};
 use std::ops::Deref;
 
 use rustc_middle::ty::{IntTy, Ty, TyKind, TypeAndMut, UintTy};
+use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::Symbol;
 use rustc_target::abi::Align;
 
@@ -62,32 +63,22 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         match ptr.provenance {
                             Provenance::Concrete { alloc_id, sb } => {
                                 intptrcast::GlobalStateInner::expose_ptr(cx, alloc_id, sb)?;
+                                // FIXME: something is wrong with this code -- it's meant to 
+                                // update the provenance to `Wildcard` and write it back to the
+                                // same location. 
+                                // I ~think~ what's happening is that the `ptr_place` is the same
+                                // place for multiple layers of pointers, so the layout of the place
+                                // doesn't match the layout of the type of pointer.
+                                // In sum: Not sure how to overwrite the provenance of a pointer.
+
+                                // let layout = cx.layout_of(*arg_type)?;
+                                // let ptr_place = MPlaceTy::from_aligned_ptr(ptr.into(), layout);
+                                // ptr.provenance = Provenance::Wildcard;
+                                // let new_k = ScalarMaybeUninit::Scalar(Scalar::Ptr(ptr, ofs));
+                                // cx.write_scalar(new_k, &ptr_place.into())?;
                             },
                             Provenance::Wildcard => { }
                         }
-                        // FIXME: something is wrong with this code, it's meant to just change 
-                        // the provenance of the current pointer to `Wildcard`...
-                        // but even just writing back the original place it breaks the pointers.
-                        // seems to be an issue with the layout, some sort of mixup between the 
-                        // pointer and pointee layouts. 
-                        // one clue is that double dereference runs but produces the wrong 
-                        // result when this code is here?
-                        // the logic here is inspired from the `retag_reference` function in 
-                        // the stacked borrows mod file.
-
-                        // let layout = cx.layout_of(*arg_type)?;
-                        // let ptr_place = MPlaceTy::from_aligned_ptr(ptr.into(), layout);
-
-                        // // // get the place the pointer is pointing to
-                        // let imm = ImmTy::from_immediate(k.into(), ptr_place.layout);
-                        // let place = cx.deref_operand(&imm.into())?;
-                        // let new_place = place;
-                        // // let new_place = place.map_provenance(|p| {
-                        // //     p.map(|sub_p| { Provenance::Wildcard })
-                        // // });
-                        // let new_imm = new_place.to_ref(cx);
-                        // let new_ptr = ImmTy::from_immediate(new_imm.into(), ptr_place.layout);
-                        // cx.write_immediate(*new_ptr, &ptr_place.into())?;
                         
                         let qq = ptr.into_parts().1.bytes_usize();
                         match (some_ty.kind(), some_mut) {
