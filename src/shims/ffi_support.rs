@@ -63,19 +63,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         match ptr.provenance {
                             Provenance::Concrete { alloc_id, sb } => {
                                 intptrcast::GlobalStateInner::expose_ptr(cx, alloc_id, sb)?;
-                                // FIXME: something is wrong with this code -- it's meant to 
-                                // update the provenance to `Wildcard` and write it back to the
-                                // same location. 
-                                // I ~think~ what's happening is that the `ptr_place` is the same
-                                // place for multiple layers of pointers, so the layout of the place
-                                // doesn't match the layout of the type of pointer.
-                                // In sum: Not sure how to overwrite the provenance of a pointer.
-
-                                // let layout = cx.layout_of(*arg_type)?;
-                                // let ptr_place = MPlaceTy::from_aligned_ptr(ptr.into(), layout);
-                                // ptr.provenance = Provenance::Wildcard;
-                                // let new_k = ScalarMaybeUninit::Scalar(Scalar::Ptr(ptr, ofs));
-                                // cx.write_scalar(new_k, &ptr_place.into())?;
                             },
                             Provenance::Wildcard => { }
                         }
