@@ -769,7 +769,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     ) -> InterpResult<'tcx> {
         match ptr.provenance {
             Provenance::Concrete { alloc_id, sb } =>
-                intptrcast::GlobalStateInner::expose_ptr(ecx, alloc_id, sb),
+                intptrcast::GlobalStateInner::expose_ptr(ecx, alloc_id, sb, ptr),
             Provenance::Wildcard => {
                 // No need to do anything for wildcard pointers as
                 // their provenances have already been previously exposed.
