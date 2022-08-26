@@ -4,7 +4,7 @@ use std::ops::Deref;
 use rustc_middle::ty::{IntTy, Ty, TyKind, TypeAndMut, UintTy};
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::Symbol;
-use rustc_target::abi::{Align, Size};
+use rustc_target::abi::Align;
 
 use crate::*;
 
@@ -143,7 +143,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         dest: &PlaceTy<'tcx, Provenance>,
         ptr: CodePtr,
         libffi_args: Vec<libffi::high::Arg<'a>>,
-    ) -> InterpResult<'tcx, Option<AllocId>> {
+    ) -> InterpResult<'tcx, ()> {
         let this = self.eval_context_mut();
 
         // Unsafe because of the call to external C code.
@@ -158,57 +158,57 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 TyKind::Int(IntTy::I8) => {
                     let x = call::<i8>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Int(IntTy::I16) => {
                     let x = call::<i16>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Int(IntTy::I32) => {
                     let x = call::<i32>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Int(IntTy::I64) => {
                     let x = call::<i64>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Int(IntTy::Isize) => {
                     let x = call::<isize>(ptr, libffi_args.as_slice());
                     // `isize` doesn't `impl Into<i128>`, so convert manually.
                     // Convert to `i64` since this covers both 32- and 64-bit machines.
                     this.write_int(i64::try_from(x).unwrap(), dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 // uints
                 TyKind::Uint(UintTy::U8) => {
                     let x = call::<u8>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Uint(UintTy::U16) => {
                     let x = call::<u16>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Uint(UintTy::U32) => {
                     let x = call::<u32>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Uint(UintTy::U64) => {
                     let x = call::<u64>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 TyKind::Uint(UintTy::Usize) => {
                     let x = call::<usize>(ptr, libffi_args.as_slice());
                     // `usize` doesn't `impl Into<i128>`, so convert manually.
                     // Convert to `u64` since this covers both 32- and 64-bit machines.
                     this.write_int(u64::try_from(x).unwrap(), dest)?;
-                    return Ok(None);
+                    return Ok(());
                 }
                 // pointers
                 TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl } ) => {
@@ -277,10 +277,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                             *mutbl,
                             MiriMemoryKind::C.into(),
                         );
-                        machine::Evaluator::<'mir, 'tcx>::expose_ptr(this, ptr)?;
-                        ptr.provenance = Provenance::Wildcard;
+                        match ptr.provenance {
+                            Provenance::Concrete { alloc_id, sb } => {
+                                intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, sb)?;
+                                ptr.provenance = Provenance::Wildcard;
+                            }
+                            Provenance::Wildcard => {
+                            }
+                        }
                         this.write_pointer(ptr, dest)?;
-                        return Ok(Some((this.ptr_get_alloc_id(ptr.into()))?.0));
+                        return Ok(());
                     }
                 }
                 // Functions with no declared return type (i.e., the default return)
@@ -288,7 +294,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 TyKind::Tuple(t_list) =>
                     if t_list.len() == 0 {
                         call::<()>(ptr, libffi_args.as_slice());
-                        return Ok(None);
+                        return Ok(());
                     },
                 _ => {}
             }
@@ -363,9 +369,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         };
 
         let this = self.eval_context_mut();
-    
+
         // Get the function arguments, and convert them to `libffi`-compatible form.
-        // This also recurively exposes all pointer arguments. 
         let mut libffi_args = Vec::<CArg>::with_capacity(args.len());
         for cur_arg in args.iter() {
             libffi_args.push(Self::scalar_to_carg(
@@ -374,7 +379,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 this,
             )?);
         }
-        
+
         // Convert them to `libffi::high::Arg` type.
         let libffi_args = libffi_args
             .iter()
@@ -385,20 +390,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         // let ptr = CodePtr(*func.deref() as *mut _);
         // Call the function and store output, depending on return type in the function signature.
         self.call_external_c_and_store_return(link_name, dest, code_ptr, libffi_args)?;
-        
+
+        // FIXME! ellen: get the `Wildcard` provenance propagation working.
+        // All exposed pointers now get marked with the `Wildcard` provenance.
         // let this = self.eval_context_mut();
-        // // All exposed pointers now get marked with the `Wildcard` provenance.
-        // let mut all_exposed = intptrcast::GlobalStateInner::get_all_exposed(this);
+        // let mut all_exposed = /* not implemented: */ intptrcast::GlobalStateInner::get_all_exposed(this);
         // for (exp_id, exp_ptr) in all_exposed.iter() {
         //     let (size, align, kind) = this.get_alloc_info(*exp_id);
         //     if matches!(kind, AllocKind::LiveData) {
         //         let alloc_ref = this.get_ptr_alloc((*exp_ptr).into(), size, align)?.unwrap();
-        //         println!("ptr: {:?}", exp_ptr);
-        //         let cur_val = alloc_ref.read_pointer(Size::ZERO);
-        //         // let exp_alloc_mut = this.get_ptr_alloc_mut((*exp_ptr).into(), size, align)?;
-        //         // let offset = Size::ZERO;
-        //         // exp_ptr.provenance = Provenance::Wildcard;
-        //         // exp_alloc_mut.unwrap().write_ptr_sized(offset, exp_ptr.into())?;
+        //         let exp_alloc_mut = this.get_ptr_alloc_mut((*exp_ptr).into(), size, align)?;
+        //         exp_ptr.provenance = Provenance::Wildcard;
+        //         exp_alloc_mut.unwrap().write_ptr_sized(/*some offset*/, exp_ptr.into())?;
         //     }
         // }
 

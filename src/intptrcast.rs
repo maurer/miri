@@ -37,8 +37,6 @@ pub struct GlobalStateInner {
     /// Whether an allocation has been exposed or not. This cannot be put
     /// into `AllocExtra` for the same reason as `base_addr`.
     exposed: FxHashSet<AllocId>,
-    exposed_ptrs: FxHashSet<(AllocId, Pointer<Provenance>)>,
-    /// Exposed pointers 
     /// This is used as a memory address when a new pointer is casted to an integer. It
     /// is always larger than any address that was previously made part of a block.
     next_base_addr: u64,
@@ -58,7 +56,6 @@ impl GlobalStateInner {
             int_to_ptr_map: BTreeMap::default(),
             base_addr: FxHashMap::default(),
             exposed: FxHashSet::default(),
-            exposed_ptrs: FxHashSet::default(),
             next_base_addr,
             provenance_mode: config.provenance_mode,
         }
@@ -114,23 +111,16 @@ impl<'mir, 'tcx> GlobalStateInner {
         global_state.exposed.contains(&alloc_id)
     }
 
-    pub fn get_all_exposed(ecx: &MiriEvalContext<'mir, 'tcx>) -> FxHashSet<(AllocId, Pointer<Provenance>)> {
-        let global_state = ecx.machine.intptrcast.borrow();
-        global_state.exposed_ptrs.clone()
-    }
-
     pub fn expose_ptr(
         ecx: &mut MiriEvalContext<'mir, 'tcx>,
         alloc_id: AllocId,
         sb: SbTag,
-        ptr: Pointer<Provenance>
     ) -> InterpResult<'tcx> {
         let global_state = ecx.machine.intptrcast.get_mut();
         // In strict mode, we don't need this, so we can save some cycles by not tracking it.
         if global_state.provenance_mode != ProvenanceMode::Strict {
             trace!("Exposing allocation id {alloc_id:?}");
             global_state.exposed.insert(alloc_id);
-            global_state.exposed_ptrs.insert((alloc_id, ptr));
             if ecx.machine.stacked_borrows.is_some() {
                 ecx.expose_tag(alloc_id, sb)?;
             }
