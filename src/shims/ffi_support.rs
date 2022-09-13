@@ -1,12 +1,228 @@
 use libffi::{high::call::*, low::CodePtr};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
+use std::mem::MaybeUninit;
+use std::borrow::Cow;
+
+
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 
 use rustc_middle::ty::{IntTy, Ty, TyKind, TypeAndMut, UintTy};
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::Symbol;
-use rustc_target::abi::Align;
+use rustc_target::abi::{Align, Size};
 
 use crate::*;
+
+/// Representation of a section of memory, starting at a particular
+/// address and of a specified length.
+/// This is how we represent bytes in an `Allocation` that can't be 
+/// owned, since they belong to a foreign process -- in particular, we
+/// use this to store pointers to C memory passed back from C FFI calls 
+/// in Miri.
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(TyEncodable, TyDecodable)]
+pub struct AddrAllocBytes {
+    /// Address of the beginning of the bytes.
+    pub addr: u64,
+    /// Size of the type of the data being stored in these bytes.
+    pub type_size: usize,
+    /// Length of the bytes, in multiples of `type_size`; 
+    /// it's in a `RefCell` since it can change depending on how it's used
+    /// in the program. UNSAFE
+    pub len: std::cell::RefCell<usize>,
+}
+
+impl AddrAllocBytes {
+    /// Length of the bytes.
+    pub fn total_len(&self) -> usize {
+        self.type_size * *self.len.borrow()
+    }
+}
+
+// Satisfy the `Hash` and `HashStable` trait requirements; can't be automatically derived.
+impl hash::Hash for AddrAllocBytes {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+        self.type_size.hash(state);
+    }
+}   
+impl<CTX> HashStable<CTX> for AddrAllocBytes {
+    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+        self.addr.hash_stable(hcx, hasher);
+        self.type_size.hash_stable(hcx, hasher);
+    }
+}
+
+// Types that can be used to represent the `bytes field of an `Allocation`. 
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(TyEncodable, TyDecodable)]
+#[derive(HashStable)]
+pub enum MachineBytes {
+    /// Owned, boxed slice of [u8].
+    Boxed(Box<[u8]>),
+    /// Address, size of the type stored, and length of the allocation.
+    /// This is used for representing pointers to bytes that belong to a 
+    /// foreign process (such as pointers into C memory, passed back to Rust
+    /// through an FFI call).
+    Addr(AddrAllocBytes),
+}
+
+
+
+    // pub fn from_raw_addr(
+    //     addr: u64,
+    //     type_size: usize,
+    //     len: usize,
+    //     align: Align,
+    //     mutability: Mutability,
+    // ) -> Self {
+    //     let addr_alloc_bytes = AddrAllocBytes { addr, type_size, len: std::cell::RefCell::new(len)};
+    //     let size = Size::from_bytes(addr_alloc_bytes.total_len());
+    //     Self {
+    //         bytes: AllocBytes::Addr(addr_alloc_bytes),
+    //         relocations: Relocations::new(),
+    //         init_mask: InitMask::new(size, true),
+    //         align,
+    //         mutability,
+    //         extra: (),
+    //     }
+    // }
+
+impl AllocBytes for MachineBytes {
+
+    fn adjust_to_align(&self, _align: Align) -> Self {
+        let len = self.get_len();
+        match self {
+            Self::Boxed(b) => {
+                let align_usize: usize = _align.bytes().try_into().unwrap();
+                let layout = std::alloc::Layout::from_size_align(len, align_usize).unwrap();
+                let mut bytes = unsafe {
+                    let buf = std::alloc::alloc(layout);
+                    let mut boxed = Box::<[MaybeUninit<u8>]>::from_raw(std::slice::from_raw_parts_mut(buf as *mut MaybeUninit<u8>, len));
+                    MachineBytes::write_maybe_uninit_slice(&mut boxed, &b);
+                    boxed.assume_init()
+                };
+                assert!(bytes.as_ptr() as usize % align_usize == 0);
+                Self::Boxed(bytes)
+            },
+            Self::Addr(_) => self
+        }
+        
+    }
+
+    fn uninit<'tcx>(size: Size, align: Align, handle_alloc_fail: () -> InterpError) -> Result<Self, InterpError<'tcx>> {
+        let align_usize: usize = align.bytes().try_into().unwrap();
+        let layout = std::alloc::Layout::from_size_align(size.bytes_usize(), align_usize).unwrap();
+        let vec_align = unsafe {
+            // https://doc.rust-lang.org/nightly/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
+            // std::alloc::alloc returns null to indicate an allocation failure: 
+            // "Returning a null pointer indicates that either memory is exhausted 
+            // or layout does not meet this allocator’s size or alignment constraints."
+            let buf = std::alloc::alloc(layout);
+            // Handle allocation failure.
+            if buf.is_null() {
+                return Err(handle_alloc_fail())
+            } 
+            Vec::from_raw_parts(buf as *mut u8, size.bytes_usize(), size.bytes_usize())
+        };
+        
+        let bytes = vec_align.into_boxed_slice();
+        assert!(bytes.as_ptr() as u64 % align.bytes() == 0);
+        Ok(Self::Boxed(bytes))
+    }
+
+    fn from_bytes<'tcx>(slice: impl Into<Cow<'tcx, [u8]>>, _align: Align) -> Self {
+        let slice: Cow<'tcx, [u8]> = slice.into();
+        let align_usize: usize = _align.bytes().try_into().unwrap();
+        let layout = std::alloc::Layout::from_size_align(slice.len(), align_usize).unwrap();
+        let bytes = unsafe {
+            let buf = std::alloc::alloc(layout);
+            let mut boxed = Box::<[MaybeUninit<u8>]>::from_raw(std::slice::from_raw_parts_mut(buf as *mut MaybeUninit<u8>, slice.len()));
+            MaybeUninit::write_slice(&mut boxed, &slice);
+            boxed.assume_init()
+        };
+        
+        assert!(bytes.as_ptr() as u64 % _align.bytes() == 0);
+        Self::Boxed(bytes)
+    }
+
+    /// The length of the bytes.
+    fn len(&self) -> usize {
+        match self {
+            Self::Boxed(b) => b.len(),
+            Self::Addr(addr_alloc_bytes) => addr_alloc_bytes.total_len(),
+        }
+    }
+
+    /// The real address of the bytes.
+    fn get_addr(&self) -> u64 {
+        match self {
+            Self::Boxed(b) => b.as_ptr() as u64,
+            Self::Addr(AddrAllocBytes{ addr, ..}) => *addr,
+        }
+    }
+
+    /// Slice of the bytes, for a specified range.
+    fn get_slice_from_range(&self, range: Range<usize>) -> &[u8] {
+        match &self {
+            Self::Boxed(b) => &b[range],
+            Self::Addr(AddrAllocBytes { addr, type_size, len }) => {
+                unsafe {
+                    let addr = *addr as *const u8;
+                    let max_len = range.end;
+                    let mut cur_len = len.borrow_mut();
+                    if max_len/(*type_size) > *cur_len {
+                        *cur_len = max_len/(*type_size);
+                    }
+                    let whole_slice = std::slice::from_raw_parts(addr, (*type_size)*(*cur_len));
+                    &whole_slice[range]
+                }
+            }
+        }
+    }
+
+    /// Mutable slice of the bytes, for a specified range.
+    fn get_slice_from_range_mut<'a>(&'a mut self, range: Range<usize>) -> &'a mut [u8]{
+        match self {
+            Self::Boxed(ref mut b) => &mut b[range],
+            Self::Addr(AddrAllocBytes{..}) => {
+                // TODO! Should this be allowed?
+                todo!();
+            }
+        }
+    }
+
+    /// Pointer addition to the base address of the bytes.
+    fn add_ptr(&mut self, to_add: usize) -> *mut u8 {
+        match self {
+            Self::Boxed(b) => {
+                b.as_mut_ptr().wrapping_add(to_add)
+            },
+            Self::Addr(AddrAllocBytes{..}) => {
+                // TODO! Should this be allowed?
+                todo!();
+            }
+        }
+    }
+
+    /// Write an `AllocBytes` to a boxed slice of `MaybeUninit` -- this serves to initialize 
+    /// the elements in `boxed`, for the length of the `AllocBytes` passed in.
+    fn write_maybe_uninit_slice(boxed: &mut Box<[MaybeUninit<u8>]>, to_write: &Self) {
+        match to_write {
+            Self::Boxed(ref b) => {
+                MaybeUninit::write_slice(boxed, &b);
+            },
+            Self::Addr(AddrAllocBytes{addr, ..}) => {
+                unsafe {
+                    let addr = *addr as *const u8;
+                    let boxed_len = boxed.len();
+                    MaybeUninit::write_slice(boxed, std::slice::from_raw_parts(addr, boxed_len));
+                }
+            }
+        }
+    }
+}
+
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriEvalContext<'mir, 'tcx> {}
 
