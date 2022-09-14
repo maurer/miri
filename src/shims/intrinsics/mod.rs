@@ -7,7 +7,10 @@ use log::trace;
 
 use rustc_apfloat::{Float, Round};
 use rustc_middle::ty::layout::{IntegerExt, LayoutOf};
-use rustc_middle::{mir, ty, ty::FloatTy};
+use rustc_middle::{
+    mir,
+    ty::{self, FloatTy, Ty},
+};
 use rustc_target::abi::Integer;
 
 use crate::*;
@@ -72,17 +75,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         match intrinsic_name {
             // Miri overwriting CTFE intrinsics.
-            "ptr_guaranteed_eq" => {
+            "ptr_guaranteed_cmp" => {
                 let [left, right] = check_arg_count(args)?;
                 let left = this.read_immediate(left)?;
                 let right = this.read_immediate(right)?;
-                this.binop_ignore_overflow(mir::BinOp::Eq, &left, &right, dest)?;
-            }
-            "ptr_guaranteed_ne" => {
-                let [left, right] = check_arg_count(args)?;
-                let left = this.read_immediate(left)?;
-                let right = this.read_immediate(right)?;
-                this.binop_ignore_overflow(mir::BinOp::Ne, &left, &right, dest)?;
+                let (val, _overflowed, _ty) =
+                    this.overflowing_binary_op(mir::BinOp::Eq, &left, &right)?;
+                // We're type punning a bool as an u8 here.
+                this.write_scalar(val, dest)?;
             }
             "const_allocate" => {
                 // For now, for compatibility with the run-time implementation of this, we just return null.
@@ -223,8 +223,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 };
                 let float_finite = |x: &ImmTy<'tcx, _>| -> InterpResult<'tcx, bool> {
                     Ok(match x.layout.ty.kind() {
-                        ty::Float(FloatTy::F32) => x.to_scalar()?.to_f32()?.is_finite(),
-                        ty::Float(FloatTy::F64) => x.to_scalar()?.to_f64()?.is_finite(),
+                        ty::Float(FloatTy::F32) => x.to_scalar().to_f32()?.is_finite(),
+                        ty::Float(FloatTy::F64) => x.to_scalar().to_f64()?.is_finite(),
                         _ => bug!(
                             "`{intrinsic_name}` called with non-float input type {ty:?}",
                             ty = x.layout.ty,
@@ -285,7 +285,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // FIXME: Using host floats.
                 let f = f32::from_bits(this.read_scalar(f)?.to_u32()?);
                 let f2 = f32::from_bits(this.read_scalar(f2)?.to_u32()?);
-                this.write_scalar(Scalar::from_u32(f.powf(f2).to_bits()), dest)?;
+                let res = f.powf(f2);
+                this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
             }
 
             "powf64" => {
@@ -293,25 +294,28 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // FIXME: Using host floats.
                 let f = f64::from_bits(this.read_scalar(f)?.to_u64()?);
                 let f2 = f64::from_bits(this.read_scalar(f2)?.to_u64()?);
-                this.write_scalar(Scalar::from_u64(f.powf(f2).to_bits()), dest)?;
+                let res = f.powf(f2);
+                this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
             }
 
             "fmaf32" => {
                 let [a, b, c] = check_arg_count(args)?;
-                let a = this.read_scalar(a)?.to_f32()?;
-                let b = this.read_scalar(b)?.to_f32()?;
-                let c = this.read_scalar(c)?.to_f32()?;
-                let res = a.mul_add(b, c).value;
-                this.write_scalar(Scalar::from_f32(res), dest)?;
+                // FIXME: Using host floats, to work around https://github.com/rust-lang/miri/issues/2468.
+                let a = f32::from_bits(this.read_scalar(a)?.to_u32()?);
+                let b = f32::from_bits(this.read_scalar(b)?.to_u32()?);
+                let c = f32::from_bits(this.read_scalar(c)?.to_u32()?);
+                let res = a.mul_add(b, c);
+                this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
             }
 
             "fmaf64" => {
                 let [a, b, c] = check_arg_count(args)?;
-                let a = this.read_scalar(a)?.to_f64()?;
-                let b = this.read_scalar(b)?.to_f64()?;
-                let c = this.read_scalar(c)?.to_f64()?;
-                let res = a.mul_add(b, c).value;
-                this.write_scalar(Scalar::from_f64(res), dest)?;
+                // FIXME: Using host floats, to work around https://github.com/rust-lang/miri/issues/2468.
+                let a = f64::from_bits(this.read_scalar(a)?.to_u64()?);
+                let b = f64::from_bits(this.read_scalar(b)?.to_u64()?);
+                let c = f64::from_bits(this.read_scalar(c)?.to_u64()?);
+                let res = a.mul_add(b, c);
+                this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
             }
 
             "powif32" => {
@@ -319,7 +323,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // FIXME: Using host floats.
                 let f = f32::from_bits(this.read_scalar(f)?.to_u32()?);
                 let i = this.read_scalar(i)?.to_i32()?;
-                this.write_scalar(Scalar::from_u32(f.powi(i).to_bits()), dest)?;
+                let res = f.powi(i);
+                this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
             }
 
             "powif64" => {
@@ -327,7 +332,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // FIXME: Using host floats.
                 let f = f64::from_bits(this.read_scalar(f)?.to_u64()?);
                 let i = this.read_scalar(i)?.to_i32()?;
-                this.write_scalar(Scalar::from_u64(f.powi(i).to_bits()), dest)?;
+                let res = f.powi(i);
+                this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
             }
 
             "float_to_int_unchecked" => {
@@ -336,9 +342,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
                 let res = match val.layout.ty.kind() {
                     ty::Float(FloatTy::F32) =>
-                        this.float_to_int_unchecked(val.to_scalar()?.to_f32()?, dest.layout.ty)?,
+                        this.float_to_int_unchecked(val.to_scalar().to_f32()?, dest.layout.ty)?,
                     ty::Float(FloatTy::F64) =>
-                        this.float_to_int_unchecked(val.to_scalar()?.to_f64()?, dest.layout.ty)?,
+                        this.float_to_int_unchecked(val.to_scalar().to_f64()?, dest.layout.ty)?,
                     _ =>
                         span_bug!(
                             this.cur_span(),
@@ -371,7 +377,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     fn float_to_int_unchecked<F>(
         &self,
         f: F,
-        dest_ty: ty::Ty<'tcx>,
+        dest_ty: Ty<'tcx>,
     ) -> InterpResult<'tcx, Scalar<Provenance>>
     where
         F: Float + Into<Scalar<Provenance>>,

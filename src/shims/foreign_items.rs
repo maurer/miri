@@ -165,6 +165,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     .expect("interpreting a non-executable crate");
                 for cnum in iter::once(LOCAL_CRATE).chain(
                     dependency_format.1.iter().enumerate().filter_map(|(num, &linkage)| {
+                        // We add 1 to the number because that's what rustc also does everywhere it
+                        // calls `CrateNum::new`...
+                        #[allow(clippy::integer_arithmetic)]
                         (linkage != Linkage::NotLinked).then_some(CrateNum::new(num + 1))
                     }),
                 ) {
@@ -367,16 +370,47 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     ) -> InterpResult<'tcx, EmulateByNameResult<'mir, 'tcx>> {
         let this = self.eval_context_mut();
 
-        // First deal with any external C functions in linked .so file
-        // (if any SO file is specified).
+        // First deal with any external C functions in linked .so file.
         if this.machine.external_so_lib.as_ref().is_some() {
             // An Ok(false) here means that the function being called was not exported
-            // by the specified SO file; we should continue and check if it corresponds to
+            // by the specified `.so` file; we should continue and check if it corresponds to
             // a provided shim.
-            if this.call_and_add_external_c_fct_to_context(link_name, dest, args)? {
+            if this.call_external_c_fct(link_name, dest, args)? {
                 return Ok(EmulateByNameResult::NeedsJumping);
             }
         }
+
+        // When adding a new shim, you should follow the following pattern:
+        // ```
+        // "shim_name" => {
+        //     let [arg1, arg2, arg3] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+        //     let result = this.shim_name(arg1, arg2, arg3)?;
+        //     this.write_scalar(result, dest)?;
+        // }
+        // ```
+        // and then define `shim_name` as a helper function in an extension trait in a suitable file
+        // (see e.g. `unix/fs.rs`):
+        // ```
+        // fn shim_name(
+        //     &mut self,
+        //     arg1: &OpTy<'tcx, Provenance>,
+        //     arg2: &OpTy<'tcx, Provenance>,
+        //     arg3: &OpTy<'tcx, Provenance>)
+        // -> InterpResult<'tcx, Scalar<Provenance>> {
+        //     let this = self.eval_context_mut();
+        //
+        //     // First thing: load all the arguments. Details depend on the shim.
+        //     let arg1 = this.read_scalar(arg1)?.to_u32()?;
+        //     let arg2 = this.read_pointer(arg2)?; // when you need to work with the pointer directly
+        //     let arg3 = this.deref_operand(arg3)?; // when you want to load/store through the pointer at its declared type
+        //
+        //     // ...
+        //
+        //     Ok(Scalar::from_u32(42))
+        // }
+        // ```
+        // You might find existing shims not following this pattern, most
+        // likely because they predate it or because for some reason they cannot be made to fit.
 
         // Here we dispatch all the shims for foreign functions. If you have a platform specific
         // shim, add it to the corresponding submodule.
@@ -526,8 +560,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let n = Size::from_bytes(this.read_scalar(n)?.to_machine_usize(this)?);
 
                 let result = {
-                    let left_bytes = this.read_bytes_ptr(left, n)?;
-                    let right_bytes = this.read_bytes_ptr(right, n)?;
+                    let left_bytes = this.read_bytes_ptr_strip_provenance(left, n)?;
+                    let right_bytes = this.read_bytes_ptr_strip_provenance(right, n)?;
 
                     use std::cmp::Ordering::*;
                     match left_bytes.cmp(right_bytes) {
@@ -549,12 +583,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let val = val as u8;
 
                 if let Some(idx) = this
-                    .read_bytes_ptr(ptr, Size::from_bytes(num))?
+                    .read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(num))?
                     .iter()
                     .rev()
                     .position(|&c| c == val)
                 {
-                    let new_ptr = ptr.offset(Size::from_bytes(num - idx as u64 - 1), this)?;
+                    let idx = u64::try_from(idx).unwrap();
+                    #[allow(clippy::integer_arithmetic)] // idx < num, so this never wraps
+                    let new_ptr = ptr.offset(Size::from_bytes(num - idx - 1), this)?;
                     this.write_pointer(new_ptr, dest)?;
                 } else {
                     this.write_null(dest)?;
@@ -570,7 +606,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let val = val as u8;
 
                 let idx = this
-                    .read_bytes_ptr(ptr, Size::from_bytes(num))?
+                    .read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(num))?
                     .iter()
                     .position(|&c| c == val);
                 if let Some(idx) = idx {
@@ -587,35 +623,42 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 this.write_scalar(Scalar::from_machine_usize(u64::try_from(n).unwrap(), this), dest)?;
             }
 
-            // math functions
+            // math functions (note that there are also intrinsics for some other functions)
             #[rustfmt::skip]
             | "cbrtf"
             | "coshf"
             | "sinhf"
             | "tanf"
+            | "tanhf"
             | "acosf"
             | "asinf"
             | "atanf"
+            | "log1pf"
+            | "expm1f"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
                 let f = f32::from_bits(this.read_scalar(f)?.to_u32()?);
-                let f = match link_name.as_str() {
+                let res = match link_name.as_str() {
                     "cbrtf" => f.cbrt(),
                     "coshf" => f.cosh(),
                     "sinhf" => f.sinh(),
                     "tanf" => f.tan(),
+                    "tanhf" => f.tanh(),
                     "acosf" => f.acos(),
                     "asinf" => f.asin(),
                     "atanf" => f.atan(),
+                    "log1pf" => f.ln_1p(),
+                    "expm1f" => f.exp_m1(),
                     _ => bug!(),
                 };
-                this.write_scalar(Scalar::from_u32(f.to_bits()), dest)?;
+                this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
             }
             #[rustfmt::skip]
             | "_hypotf"
             | "hypotf"
             | "atan2f"
+            | "fdimf"
             => {
                 let [f1, f2] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // underscore case for windows, here and below
@@ -623,52 +666,63 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // FIXME: Using host floats.
                 let f1 = f32::from_bits(this.read_scalar(f1)?.to_u32()?);
                 let f2 = f32::from_bits(this.read_scalar(f2)?.to_u32()?);
-                let n = match link_name.as_str() {
+                let res = match link_name.as_str() {
                     "_hypotf" | "hypotf" => f1.hypot(f2),
                     "atan2f" => f1.atan2(f2),
+                    #[allow(deprecated)]
+                    "fdimf" => f1.abs_sub(f2),
                     _ => bug!(),
                 };
-                this.write_scalar(Scalar::from_u32(n.to_bits()), dest)?;
+                this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
             }
             #[rustfmt::skip]
             | "cbrt"
             | "cosh"
             | "sinh"
             | "tan"
+            | "tanh"
             | "acos"
             | "asin"
             | "atan"
+            | "log1p"
+            | "expm1"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
                 let f = f64::from_bits(this.read_scalar(f)?.to_u64()?);
-                let f = match link_name.as_str() {
+                let res = match link_name.as_str() {
                     "cbrt" => f.cbrt(),
                     "cosh" => f.cosh(),
                     "sinh" => f.sinh(),
                     "tan" => f.tan(),
+                    "tanh" => f.tanh(),
                     "acos" => f.acos(),
                     "asin" => f.asin(),
                     "atan" => f.atan(),
+                    "log1p" => f.ln_1p(),
+                    "expm1" => f.exp_m1(),
                     _ => bug!(),
                 };
-                this.write_scalar(Scalar::from_u64(f.to_bits()), dest)?;
+                this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
             }
             #[rustfmt::skip]
             | "_hypot"
             | "hypot"
             | "atan2"
+            | "fdim"
             => {
                 let [f1, f2] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
                 let f1 = f64::from_bits(this.read_scalar(f1)?.to_u64()?);
                 let f2 = f64::from_bits(this.read_scalar(f2)?.to_u64()?);
-                let n = match link_name.as_str() {
+                let res = match link_name.as_str() {
                     "_hypot" | "hypot" => f1.hypot(f2),
                     "atan2" => f1.atan2(f2),
+                    #[allow(deprecated)]
+                    "fdim" => f1.abs_sub(f2),
                     _ => bug!(),
                 };
-                this.write_scalar(Scalar::from_u64(n.to_bits()), dest)?;
+                this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
             }
             #[rustfmt::skip]
             | "_ldexp"
@@ -680,7 +734,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let x = this.read_scalar(x)?.to_f64()?;
                 let exp = this.read_scalar(exp)?.to_i32()?;
 
-                // Saturating cast to i16. Even those are outside the valid exponent range to
+                // Saturating cast to i16. Even those are outside the valid exponent range so
                 // `scalbn` below will do its over/underflow handling.
                 let exp = if exp > i32::from(i16::MAX) {
                     i16::MAX
@@ -702,7 +756,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let a = this.read_scalar(a)?.to_u64()?;
                 let b = this.read_scalar(b)?.to_u64()?;
 
+                #[allow(clippy::integer_arithmetic)] // adding two u64 and a u8 cannot wrap in a u128
                 let wide_sum = u128::from(c_in) + u128::from(a) + u128::from(b);
+                #[allow(clippy::integer_arithmetic)] // it's a u128, we can shift by 64
                 let (c_out, sum) = ((wide_sum >> 64).truncate::<u8>(), wide_sum.truncate::<u64>());
 
                 let c_out_field = this.place_field(dest, 0)?;

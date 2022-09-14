@@ -63,6 +63,7 @@ impl<'tcx> Default for TlsData<'tcx> {
 impl<'tcx> TlsData<'tcx> {
     /// Generate a new TLS key with the given destructor.
     /// `max_size` determines the integer size the key has to fit in.
+    #[allow(clippy::integer_arithmetic)]
     pub fn create_tls_key(
         &mut self,
         dtor: Option<ty::Instance<'tcx>>,
@@ -164,8 +165,8 @@ impl<'tcx> TlsData<'tcx> {
     /// and the thread has a non-NULL value associated with that key,
     /// the value of the key is set to NULL, and then the function pointed
     /// to is called with the previously associated value as its sole argument.
-    /// The order of destructor calls is unspecified if more than one destructor
-    /// exists for a thread when it exits.
+    /// **The order of destructor calls is unspecified if more than one destructor
+    /// exists for a thread when it exits.**
     ///
     /// If, after all the destructors have been called for all non-NULL values
     /// with associated destructors, there are still some non-NULL values with
@@ -187,6 +188,13 @@ impl<'tcx> TlsData<'tcx> {
             Some(key) => Excluded(key),
             None => Unbounded,
         };
+        // We interpret the documentaion above (taken from POSIX) as saying that we need to iterate
+        // over all keys and run each destructor at least once before running any destructor a 2nd
+        // time. That's why we have `key` to indicate how far we got in the current iteration. If we
+        // return `None`, `schedule_next_pthread_tls_dtor` will re-try with `ket` set to `None` to
+        // start the next round.
+        // TODO: In the future, we might consider randomizing destructor order, but we still have to
+        // uphold this requirement.
         for (&key, TlsEntry { data, dtor }) in thread_local.range_mut((start, Unbounded)) {
             match data.entry(thread_id) {
                 BTreeEntry::Occupied(entry) => {
@@ -225,29 +233,38 @@ impl<'tcx> TlsData<'tcx> {
             data.remove(&thread_id);
         }
     }
+
+    pub fn iter(&self, mut visitor: impl FnMut(&Scalar<Provenance>)) {
+        for scalar in self.keys.values().flat_map(|v| v.data.values()) {
+            visitor(scalar);
+        }
+    }
 }
 
 impl<'mir, 'tcx: 'mir> EvalContextPrivExt<'mir, 'tcx> for crate::MiriEvalContext<'mir, 'tcx> {}
 trait EvalContextPrivExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx> {
-    /// Schedule TLS destructors for the main thread on Windows. The
-    /// implementation assumes that we do not support concurrency on Windows
-    /// yet.
+    /// Schedule TLS destructors for Windows.
+    /// On windows, TLS destructors are managed by std.
     fn schedule_windows_tls_dtors(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let active_thread = this.get_active_thread();
-        assert_eq!(this.get_total_thread_count(), 1, "concurrency on Windows is not supported");
+
         // Windows has a special magic linker section that is run on certain events.
         // Instead of searching for that section and supporting arbitrary hooks in there
         // (that would be basically https://github.com/rust-lang/miri/issues/450),
         // we specifically look up the static in libstd that we know is placed
         // in that section.
-        let thread_callback = this
-            .eval_path_scalar(&["std", "sys", "windows", "thread_local_key", "p_thread_callback"])?
-            .to_pointer(this)?;
+        let thread_callback =
+            this.eval_windows("thread_local_key", "p_thread_callback")?.to_pointer(this)?;
         let thread_callback = this.get_ptr_fn(thread_callback)?.as_instance()?;
 
+        // FIXME: Technically, the reason should be `DLL_PROCESS_DETACH` when the main thread exits
+        // but std treats both the same.
+        let reason = this.eval_windows("c", "DLL_THREAD_DETACH")?;
+
         // The signature of this function is `unsafe extern "system" fn(h: c::LPVOID, dwReason: c::DWORD, pv: c::LPVOID)`.
-        let reason = this.eval_path_scalar(&["std", "sys", "windows", "c", "DLL_THREAD_DETACH"])?;
+        // FIXME: `h` should be a handle to the current module and what `pv` should be is unknown
+        // but both are ignored by std
         this.call_function(
             thread_callback,
             Abi::System { unwind: false },

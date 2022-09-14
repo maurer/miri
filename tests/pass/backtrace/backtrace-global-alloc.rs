@@ -1,6 +1,5 @@
 //@compile-flags: -Zmiri-disable-isolation
-
-#![feature(backtrace)]
+//@rustc-env: RUST_BACKTRACE=1
 
 use std::alloc::System;
 use std::backtrace::Backtrace;

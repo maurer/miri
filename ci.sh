@@ -2,15 +2,18 @@
 set -euo pipefail
 set -x
 
-# Determine configuration
+# Determine configuration for installed build
+echo "Installing release version of Miri"
 export RUSTFLAGS="-D warnings"
 export CARGO_INCREMENTAL=0
-export CARGO_EXTRA_FLAGS="--all-features"
-
-# Prepare
-echo "Build and install miri"
 ./miri install # implicitly locked
-./miri build --all-targets --locked # the build that all the `./miri test` below will use
+
+# Prepare debug build for direct `./miri` invocations
+echo "Building debug version of Miri"
+export CARGO_EXTRA_FLAGS="--locked"
+./miri check --no-default-features # make sure this can be built
+./miri check --all-features # and this, too
+./miri build --all-targets # the build that all the `./miri test` below will use
 echo
 
 # Test
@@ -22,13 +25,13 @@ function run_tests {
   fi
 
   ## ui test suite
-  ./miri test --locked
+  ./miri test
   if [ -z "${MIRI_TEST_TARGET+exists}" ]; then
     # Only for host architecture: tests with optimizations (`-O` is what cargo passes, but crank MIR
     # optimizations up all the way).
     # Optimizations change diagnostics (mostly backtraces), so we don't check them
     #FIXME(#2155): we want to only run the pass and panic tests here, not the fail tests.
-    MIRIFLAGS="-O -Zmir-opt-level=4" MIRI_SKIP_UI_CHECKS=1 ./miri test --locked -- tests/{pass,panic}
+    MIRIFLAGS="${MIRIFLAGS:-} -O -Zmir-opt-level=4" MIRI_SKIP_UI_CHECKS=1 ./miri test -- tests/{pass,panic}
   fi
 
   ## test-cargo-miri
@@ -54,8 +57,8 @@ function run_tests {
   unset RUSTC MIRI
   rm -rf .cargo
 
-  # Ensure that our benchmarks all work, on the host at least.
-  if [ -z "${MIRI_TEST_TARGET+exists}" ]; then
+  # Ensure that our benchmarks all work, but only on Linux hosts.
+  if [ -z "${MIRI_TEST_TARGET+exists}" ] && [ "$HOST_TARGET" = x86_64-unknown-linux-gnu ] ; then
     for BENCH in $(ls "bench-cargo-miri"); do
       cargo miri run --manifest-path bench-cargo-miri/$BENCH/Cargo.toml
     done
@@ -69,7 +72,7 @@ function run_tests_minimal {
     echo "Testing MINIMAL host architecture: only testing $@"
   fi
 
-  ./miri test --locked -- "$@"
+  ./miri test -- "$@"
 }
 
 # host
@@ -80,7 +83,8 @@ case $HOST_TARGET in
     MIRI_TEST_TARGET=i686-unknown-linux-gnu run_tests
     MIRI_TEST_TARGET=aarch64-apple-darwin run_tests
     MIRI_TEST_TARGET=i686-pc-windows-msvc run_tests
-    MIRI_TEST_TARGET=x86_64-unknown-freebsd run_tests_minimal hello integer vec current_dir data_race env
+    MIRI_TEST_TARGET=x86_64-unknown-freebsd run_tests_minimal hello integer vec panic/panic concurrency/simple atomic data_race env/var
+    MIRI_TEST_TARGET=aarch64-linux-android run_tests_minimal hello integer vec panic/panic
     MIRI_TEST_TARGET=thumbv7em-none-eabihf MIRI_NO_STD=1 run_tests_minimal no_std # no_std embedded architecture
     ;;
   x86_64-apple-darwin)

@@ -60,13 +60,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     let op = this.read_immediate(&this.mplace_index(&op, i)?.into())?;
                     let dest = this.mplace_index(&dest, i)?;
                     let val = match which {
-                        Op::MirOp(mir_op) => this.unary_op(mir_op, &op)?.to_scalar()?,
+                        Op::MirOp(mir_op) => this.unary_op(mir_op, &op)?.to_scalar(),
                         Op::Abs => {
                             // Works for f32 and f64.
                             let ty::Float(float_ty) = op.layout.ty.kind() else {
                                 span_bug!(this.cur_span(), "{} operand is not a float", intrinsic_name)
                             };
-                            let op = op.to_scalar()?;
+                            let op = op.to_scalar();
                             match float_ty {
                                 FloatTy::F32 => Scalar::from_f32(op.to_f32()?.abs()),
                                 FloatTy::F64 => Scalar::from_f64(op.to_f64()?.abs()),
@@ -79,7 +79,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                             // FIXME using host floats
                             match float_ty {
                                 FloatTy::F32 => {
-                                    let f = f32::from_bits(op.to_scalar()?.to_u32()?);
+                                    let f = f32::from_bits(op.to_scalar().to_u32()?);
                                     let res = match host_op {
                                         HostFloatOp::Ceil => f.ceil(),
                                         HostFloatOp::Floor => f.floor(),
@@ -90,7 +90,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                                     Scalar::from_u32(res.to_bits())
                                 }
                                 FloatTy::F64 => {
-                                    let f = f64::from_bits(op.to_scalar()?.to_u64()?);
+                                    let f = f64::from_bits(op.to_scalar().to_u64()?);
                                     let res = match host_op {
                                         HostFloatOp::Ceil => f.ceil(),
                                         HostFloatOp::Floor => f.floor(),
@@ -182,7 +182,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                                 // Shifts have extra UB as SIMD operations that the MIR binop does not have.
                                 // See <https://github.com/rust-lang/rust/issues/91237>.
                                 if overflowed {
-                                    let r_val = right.to_scalar()?.to_bits(right.layout.size)?;
+                                    let r_val = right.to_scalar().to_bits(right.layout.size)?;
                                     throw_ub_format!("overflowing shift by {r_val} in `simd_{intrinsic_name}` in SIMD lane {i}");
                                 }
                             }
@@ -201,8 +201,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                             this.saturating_arith(mir_op, &left, &right)?
                         }
                         Op::WrappingOffset => {
-                            let ptr = left.to_scalar()?.to_pointer(this)?;
-                            let offset_count = right.to_scalar()?.to_machine_isize(this)?;
+                            let ptr = left.to_scalar().to_pointer(this)?;
+                            let offset_count = right.to_scalar().to_machine_isize(this)?;
                             let pointee_ty = left.layout.ty.builtin_deref(true).unwrap().ty;
 
                             let pointee_size = i64::try_from(this.layout_of(pointee_ty)?.size.bytes()).unwrap();
@@ -232,20 +232,31 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 assert_eq!(dest_len, c_len);
 
                 for i in 0..dest_len {
-                    let a = this.read_immediate(&this.mplace_index(&a, i)?.into())?.to_scalar()?;
-                    let b = this.read_immediate(&this.mplace_index(&b, i)?.into())?.to_scalar()?;
-                    let c = this.read_immediate(&this.mplace_index(&c, i)?.into())?.to_scalar()?;
+                    let a = this.read_scalar(&this.mplace_index(&a, i)?.into())?;
+                    let b = this.read_scalar(&this.mplace_index(&b, i)?.into())?;
+                    let c = this.read_scalar(&this.mplace_index(&c, i)?.into())?;
                     let dest = this.mplace_index(&dest, i)?;
 
                     // Works for f32 and f64.
+                    // FIXME: using host floats to work around https://github.com/rust-lang/miri/issues/2468.
                     let ty::Float(float_ty) = dest.layout.ty.kind() else {
                         span_bug!(this.cur_span(), "{} operand is not a float", intrinsic_name)
                     };
                     let val = match float_ty {
-                        FloatTy::F32 =>
-                            Scalar::from_f32(a.to_f32()?.mul_add(b.to_f32()?, c.to_f32()?).value),
-                        FloatTy::F64 =>
-                            Scalar::from_f64(a.to_f64()?.mul_add(b.to_f64()?, c.to_f64()?).value),
+                        FloatTy::F32 => {
+                            let a = f32::from_bits(a.to_u32()?);
+                            let b = f32::from_bits(b.to_u32()?);
+                            let c = f32::from_bits(c.to_u32()?);
+                            let res = a.mul_add(b, c);
+                            Scalar::from_u32(res.to_bits())
+                        }
+                        FloatTy::F64 => {
+                            let a = f64::from_bits(a.to_u64()?);
+                            let b = f64::from_bits(b.to_u64()?);
+                            let c = f64::from_bits(c.to_u64()?);
+                            let res = a.mul_add(b, c);
+                            Scalar::from_u64(res.to_bits())
+                        }
                     };
                     this.write_scalar(val, &dest.into())?;
                 }
@@ -304,7 +315,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                                 ImmTy::from_scalar(fmax_op(&res, &op)?, res.layout)
                             } else {
                                 // Just boring integers, so NaNs to worry about
-                                if this.binary_op(BinOp::Ge, &res, &op)?.to_scalar()?.to_bool()? {
+                                if this.binary_op(BinOp::Ge, &res, &op)?.to_scalar().to_bool()? {
                                     res
                                 } else {
                                     op
@@ -316,7 +327,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                                 ImmTy::from_scalar(fmin_op(&res, &op)?, res.layout)
                             } else {
                                 // Just boring integers, so NaNs to worry about
-                                if this.binary_op(BinOp::Le, &res, &op)?.to_scalar()?.to_bool()? {
+                                if this.binary_op(BinOp::Le, &res, &op)?.to_scalar().to_bool()? {
                                     res
                                 } else {
                                     op
@@ -382,26 +393,26 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 assert_eq!(bitmask_len, mask.layout.size.bits());
                 assert_eq!(dest_len, yes_len);
                 assert_eq!(dest_len, no_len);
+                let dest_len = u32::try_from(dest_len).unwrap();
+                let bitmask_len = u32::try_from(bitmask_len).unwrap();
 
-                let mask: u64 = this
-                    .read_scalar(mask)?
-                    .check_init()?
-                    .to_bits(mask.layout.size)?
-                    .try_into()
-                    .unwrap();
+                let mask: u64 =
+                    this.read_scalar(mask)?.to_bits(mask.layout.size)?.try_into().unwrap();
                 for i in 0..dest_len {
-                    let mask =
-                        mask & (1 << simd_bitmask_index(i, dest_len, this.data_layout().endian));
-                    let yes = this.read_immediate(&this.mplace_index(&yes, i)?.into())?;
-                    let no = this.read_immediate(&this.mplace_index(&no, i)?.into())?;
-                    let dest = this.mplace_index(&dest, i)?;
+                    let mask = mask
+                        & 1u64
+                            .checked_shl(simd_bitmask_index(i, dest_len, this.data_layout().endian))
+                            .unwrap();
+                    let yes = this.read_immediate(&this.mplace_index(&yes, i.into())?.into())?;
+                    let no = this.read_immediate(&this.mplace_index(&no, i.into())?.into())?;
+                    let dest = this.mplace_index(&dest, i.into())?;
 
                     let val = if mask != 0 { yes } else { no };
                     this.write_immediate(*val, &dest.into())?;
                 }
                 for i in dest_len..bitmask_len {
                     // If the mask is "padded", ensure that padding is all-zero.
-                    let mask = mask & (1 << i);
+                    let mask = mask & 1u64.checked_shl(i).unwrap();
                     if mask != 0 {
                         throw_ub_format!(
                             "a SIMD bitmask less than 8 bits long must be filled with 0s for the remaining bits"
@@ -435,9 +446,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                             this.misc_cast(&op, dest.layout.ty)?,
                         // Float-to-int in unchecked mode
                         (ty::Float(FloatTy::F32), ty::Int(_) | ty::Uint(_)) if !safe_cast =>
-                            this.float_to_int_unchecked(op.to_scalar()?.to_f32()?, dest.layout.ty)?.into(),
+                            this.float_to_int_unchecked(op.to_scalar().to_f32()?, dest.layout.ty)?.into(),
                         (ty::Float(FloatTy::F64), ty::Int(_) | ty::Uint(_)) if !safe_cast =>
-                            this.float_to_int_unchecked(op.to_scalar()?.to_f64()?, dest.layout.ty)?.into(),
+                            this.float_to_int_unchecked(op.to_scalar().to_f64()?, dest.layout.ty)?.into(),
                         _ =>
                             throw_unsup_format!(
                                 "Unsupported SIMD cast from element type {from_ty} to {to_ty}",
@@ -466,7 +477,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 for i in 0..dest_len {
                     let src_index: u64 = this
                         .read_immediate(&this.operand_index(index, i)?)?
-                        .to_scalar()?
+                        .to_scalar()
                         .to_u32()?
                         .into();
                     let dest = this.mplace_index(&dest, i)?;
@@ -474,9 +485,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     let val = if src_index < left_len {
                         this.read_immediate(&this.mplace_index(&left, src_index)?.into())?
                     } else if src_index < left_len.checked_add(right_len).unwrap() {
-                        this.read_immediate(
-                            &this.mplace_index(&right, src_index - left_len)?.into(),
-                        )?
+                        let right_idx = src_index.checked_sub(left_len).unwrap();
+                        this.read_immediate(&this.mplace_index(&right, right_idx)?.into())?
                     } else {
                         span_bug!(
                             this.cur_span(),
@@ -540,12 +550,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 assert!(dest.layout.ty.is_integral());
                 assert!(bitmask_len <= 64);
                 assert_eq!(bitmask_len, dest.layout.size.bits());
+                let op_len = u32::try_from(op_len).unwrap();
 
                 let mut res = 0u64;
                 for i in 0..op_len {
-                    let op = this.read_immediate(&this.mplace_index(&op, i)?.into())?;
+                    let op = this.read_immediate(&this.mplace_index(&op, i.into())?.into())?;
                     if simd_element_to_bool(op)? {
-                        res |= 1 << simd_bitmask_index(i, op_len, this.data_layout().endian);
+                        res |= 1u64
+                            .checked_shl(simd_bitmask_index(i, op_len, this.data_layout().endian))
+                            .unwrap();
                     }
                 }
                 this.write_int(res, dest)?;
@@ -564,7 +577,7 @@ fn bool_to_simd_element(b: bool, size: Size) -> Scalar<Provenance> {
 }
 
 fn simd_element_to_bool(elem: ImmTy<'_, Provenance>) -> InterpResult<'_, bool> {
-    let val = elem.to_scalar()?.to_int(elem.layout.size)?;
+    let val = elem.to_scalar().to_int(elem.layout.size)?;
     Ok(match val {
         0 => false,
         -1 => true,
@@ -572,10 +585,11 @@ fn simd_element_to_bool(elem: ImmTy<'_, Provenance>) -> InterpResult<'_, bool> {
     })
 }
 
-fn simd_bitmask_index(idx: u64, vec_len: u64, endianess: Endian) -> u64 {
+fn simd_bitmask_index(idx: u32, vec_len: u32, endianess: Endian) -> u32 {
     assert!(idx < vec_len);
     match endianess {
         Endian::Little => idx,
+        #[allow(clippy::integer_arithmetic)] // idx < vec_len
         Endian::Big => vec_len - 1 - idx, // reverse order of bits
     }
 }
@@ -588,8 +602,8 @@ fn fmax_op<'tcx>(
     let ty::Float(float_ty) = left.layout.ty.kind() else {
         bug!("fmax operand is not a float")
     };
-    let left = left.to_scalar()?;
-    let right = right.to_scalar()?;
+    let left = left.to_scalar();
+    let right = right.to_scalar();
     Ok(match float_ty {
         FloatTy::F32 => Scalar::from_f32(left.to_f32()?.max(right.to_f32()?)),
         FloatTy::F64 => Scalar::from_f64(left.to_f64()?.max(right.to_f64()?)),
@@ -604,8 +618,8 @@ fn fmin_op<'tcx>(
     let ty::Float(float_ty) = left.layout.ty.kind() else {
         bug!("fmin operand is not a float")
     };
-    let left = left.to_scalar()?;
-    let right = right.to_scalar()?;
+    let left = left.to_scalar();
+    let right = right.to_scalar();
     Ok(match float_ty {
         FloatTy::F32 => Scalar::from_f32(left.to_f32()?.min(right.to_f32()?)),
         FloatTy::F64 => Scalar::from_f64(left.to_f64()?.min(right.to_f64()?)),
