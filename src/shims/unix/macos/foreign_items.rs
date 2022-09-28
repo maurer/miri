@@ -17,36 +17,38 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     ) -> InterpResult<'tcx, EmulateByNameResult<'mir, 'tcx>> {
         let this = self.eval_context_mut();
 
+        // See `fn emulate_foreign_item_by_name` in `shims/foreign_items.rs` for the general pattern.
+
         match link_name.as_str() {
             // errno
             "__error" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let errno_place = this.last_error_place()?;
-                this.write_scalar(errno_place.to_ref(this).to_scalar()?, dest)?;
+                this.write_scalar(errno_place.to_ref(this).to_scalar(), dest)?;
             }
 
             // File related shims
             "close$NOCANCEL" => {
                 let [result] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.close(result)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
             "stat" | "stat64" | "stat$INODE64" => {
                 let [path, buf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.macos_stat(path, buf)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
             "lstat" | "lstat64" | "lstat$INODE64" => {
                 let [path, buf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.macos_lstat(path, buf)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
             "fstat" | "fstat64" | "fstat$INODE64" => {
                 let [fd, buf] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.macos_fstat(fd, buf)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
             "opendir$INODE64" => {
                 let [name] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
@@ -57,21 +59,27 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let [dirp, entry, result] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.macos_readdir_r(dirp, entry, result)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
             "lseek" => {
                 let [fd, offset, whence] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // macOS is 64bit-only, so this is lseek64
                 let result = this.lseek64(fd, offset, whence)?;
-                this.write_scalar(Scalar::from_i64(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
             "ftruncate" => {
                 let [fd, length] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // macOS is 64bit-only, so this is ftruncate64
                 let result = this.ftruncate64(fd, length)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
+            }
+            "realpath$DARWIN_EXTSN" => {
+                let [path, resolved_path] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let result = this.realpath(path, resolved_path)?;
+                this.write_scalar(result, dest)?;
             }
 
             // Environment related shims
@@ -87,13 +95,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             "mach_absolute_time" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.mach_absolute_time()?;
-                this.write_scalar(Scalar::from_u64(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
 
             "mach_timebase_info" => {
                 let [info] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.mach_timebase_info(info)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
 
             // Access to command-line arguments
@@ -111,6 +119,33 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     dest,
                 )?;
             }
+            "_NSGetExecutablePath" => {
+                let [buf, bufsize] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                this.check_no_isolation("`_NSGetExecutablePath`")?;
+
+                let buf_ptr = this.read_pointer(buf)?;
+                let bufsize = this.deref_operand(bufsize)?;
+
+                // Using the host current_exe is a bit off, but consistent with Linux
+                // (where stdlib reads /proc/self/exe).
+                let path = std::env::current_exe().unwrap();
+                let (written, size_needed) = this.write_path_to_c_str(
+                    &path,
+                    buf_ptr,
+                    this.read_scalar(&bufsize.into())?.to_u32()?.into(),
+                )?;
+
+                if written {
+                    this.write_null(dest)?;
+                } else {
+                    this.write_scalar(
+                        Scalar::from_u32(size_needed.try_into().unwrap()),
+                        &bufsize.into(),
+                    )?;
+                    this.write_int(-1, dest)?;
+                }
+            }
 
             // Thread-local storage
             "_tlv_atexit" => {
@@ -118,7 +153,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let dtor = this.read_pointer(dtor)?;
                 let dtor = this.get_ptr_fn(dtor)?.as_instance()?;
-                let data = this.read_scalar(data)?.check_init()?;
+                let data = this.read_scalar(data)?;
                 let active_thread = this.get_active_thread();
                 this.machine.tls.set_macos_thread_dtor(active_thread, dtor, data)?;
             }
@@ -140,8 +175,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             // Threading
             "pthread_setname_np" => {
                 let [name] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let name = this.read_pointer(name)?;
-                this.pthread_setname_np(name)?;
+                let thread = this.pthread_self()?;
+                this.pthread_setname_np(thread, this.read_scalar(name)?)?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
@@ -150,7 +185,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // This is a horrible hack, but since the guard page mechanism calls mmap and expects a particular return value, we just give it that value.
                 let [addr, _, _, _, _, _] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let addr = this.read_scalar(addr)?.check_init()?;
+                let addr = this.read_scalar(addr)?;
                 this.write_scalar(addr, dest)?;
             }
 

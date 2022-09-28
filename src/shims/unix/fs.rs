@@ -1,10 +1,11 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::convert::TryInto;
 use std::fs::{
     read_dir, remove_dir, remove_file, rename, DirBuilder, File, FileType, OpenOptions, ReadDir,
 };
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use log::trace;
@@ -13,6 +14,7 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::ty::{self, layout::LayoutOf};
 use rustc_target::abi::{Align, Size};
 
+use crate::shims::os_str::bytes_to_os_str;
 use crate::*;
 use shims::os_str::os_str_to_bytes;
 use shims::time::system_time_to_duration;
@@ -24,38 +26,56 @@ struct FileHandle {
 }
 
 trait FileDescriptor: std::fmt::Debug {
-    fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle>;
+    fn name(&self) -> &'static str;
+
+    fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle> {
+        throw_unsup_format!("{} cannot be used as FileHandle", self.name());
+    }
 
     fn read<'tcx>(
         &mut self,
-        communicate_allowed: bool,
-        bytes: &mut [u8],
-    ) -> InterpResult<'tcx, io::Result<usize>>;
+        _communicate_allowed: bool,
+        _bytes: &mut [u8],
+    ) -> InterpResult<'tcx, io::Result<usize>> {
+        throw_unsup_format!("cannot read from {}", self.name());
+    }
 
     fn write<'tcx>(
         &self,
-        communicate_allowed: bool,
-        bytes: &[u8],
-    ) -> InterpResult<'tcx, io::Result<usize>>;
+        _communicate_allowed: bool,
+        _bytes: &[u8],
+    ) -> InterpResult<'tcx, io::Result<usize>> {
+        throw_unsup_format!("cannot write to {}", self.name());
+    }
 
     fn seek<'tcx>(
         &mut self,
-        communicate_allowed: bool,
-        offset: SeekFrom,
-    ) -> InterpResult<'tcx, io::Result<u64>>;
+        _communicate_allowed: bool,
+        _offset: SeekFrom,
+    ) -> InterpResult<'tcx, io::Result<u64>> {
+        throw_unsup_format!("cannot seek on {}", self.name());
+    }
 
     fn close<'tcx>(
         self: Box<Self>,
         _communicate_allowed: bool,
-    ) -> InterpResult<'tcx, io::Result<i32>>;
+    ) -> InterpResult<'tcx, io::Result<i32>> {
+        throw_unsup_format!("cannot close {}", self.name());
+    }
 
     fn dup(&mut self) -> io::Result<Box<dyn FileDescriptor>>;
 
     #[cfg(unix)]
-    fn as_unix_host_fd(&self) -> Option<i32>;
+    fn as_unix_host_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 impl FileDescriptor for FileHandle {
+    fn name(&self) -> &'static str {
+        "FILE"
+    }
+
     fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle> {
         Ok(self)
     }
@@ -126,8 +146,8 @@ impl FileDescriptor for FileHandle {
 }
 
 impl FileDescriptor for io::Stdin {
-    fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle> {
-        throw_unsup_format!("stdin cannot be used as FileHandle");
+    fn name(&self) -> &'static str {
+        "stdin"
     }
 
     fn read<'tcx>(
@@ -142,29 +162,6 @@ impl FileDescriptor for io::Stdin {
         Ok(Read::read(self, bytes))
     }
 
-    fn write<'tcx>(
-        &self,
-        _communicate_allowed: bool,
-        _bytes: &[u8],
-    ) -> InterpResult<'tcx, io::Result<usize>> {
-        throw_unsup_format!("cannot write to stdin");
-    }
-
-    fn seek<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _offset: SeekFrom,
-    ) -> InterpResult<'tcx, io::Result<u64>> {
-        throw_unsup_format!("cannot seek on stdin");
-    }
-
-    fn close<'tcx>(
-        self: Box<Self>,
-        _communicate_allowed: bool,
-    ) -> InterpResult<'tcx, io::Result<i32>> {
-        throw_unsup_format!("stdin cannot be closed");
-    }
-
     fn dup(&mut self) -> io::Result<Box<dyn FileDescriptor>> {
         Ok(Box::new(io::stdin()))
     }
@@ -176,16 +173,8 @@ impl FileDescriptor for io::Stdin {
 }
 
 impl FileDescriptor for io::Stdout {
-    fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle> {
-        throw_unsup_format!("stdout cannot be used as FileHandle");
-    }
-
-    fn read<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _bytes: &mut [u8],
-    ) -> InterpResult<'tcx, io::Result<usize>> {
-        throw_unsup_format!("cannot read from stdout");
+    fn name(&self) -> &'static str {
+        "stdout"
     }
 
     fn write<'tcx>(
@@ -205,21 +194,6 @@ impl FileDescriptor for io::Stdout {
         Ok(result)
     }
 
-    fn seek<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _offset: SeekFrom,
-    ) -> InterpResult<'tcx, io::Result<u64>> {
-        throw_unsup_format!("cannot seek on stdout");
-    }
-
-    fn close<'tcx>(
-        self: Box<Self>,
-        _communicate_allowed: bool,
-    ) -> InterpResult<'tcx, io::Result<i32>> {
-        throw_unsup_format!("stdout cannot be closed");
-    }
-
     fn dup(&mut self) -> io::Result<Box<dyn FileDescriptor>> {
         Ok(Box::new(io::stdout()))
     }
@@ -231,16 +205,8 @@ impl FileDescriptor for io::Stdout {
 }
 
 impl FileDescriptor for io::Stderr {
-    fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle> {
-        throw_unsup_format!("stderr cannot be used as FileHandle");
-    }
-
-    fn read<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _bytes: &mut [u8],
-    ) -> InterpResult<'tcx, io::Result<usize>> {
-        throw_unsup_format!("cannot read from stderr");
+    fn name(&self) -> &'static str {
+        "stderr"
     }
 
     fn write<'tcx>(
@@ -251,21 +217,6 @@ impl FileDescriptor for io::Stderr {
         // We allow writing to stderr even with isolation enabled.
         // No need to flush, stderr is not buffered.
         Ok(Write::write(&mut { self }, bytes))
-    }
-
-    fn seek<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _offset: SeekFrom,
-    ) -> InterpResult<'tcx, io::Result<u64>> {
-        throw_unsup_format!("cannot seek on stderr");
-    }
-
-    fn close<'tcx>(
-        self: Box<Self>,
-        _communicate_allowed: bool,
-    ) -> InterpResult<'tcx, io::Result<i32>> {
-        throw_unsup_format!("stderr cannot be closed");
     }
 
     fn dup(&mut self) -> io::Result<Box<dyn FileDescriptor>> {
@@ -282,16 +233,8 @@ impl FileDescriptor for io::Stderr {
 struct DummyOutput;
 
 impl FileDescriptor for DummyOutput {
-    fn as_file_handle<'tcx>(&self) -> InterpResult<'tcx, &FileHandle> {
-        throw_unsup_format!("stderr and stdout cannot be used as FileHandle");
-    }
-
-    fn read<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _bytes: &mut [u8],
-    ) -> InterpResult<'tcx, io::Result<usize>> {
-        throw_unsup_format!("cannot read from stderr or stdout");
+    fn name(&self) -> &'static str {
+        "stderr and stdout"
     }
 
     fn write<'tcx>(
@@ -303,28 +246,8 @@ impl FileDescriptor for DummyOutput {
         Ok(Ok(bytes.len()))
     }
 
-    fn seek<'tcx>(
-        &mut self,
-        _communicate_allowed: bool,
-        _offset: SeekFrom,
-    ) -> InterpResult<'tcx, io::Result<u64>> {
-        throw_unsup_format!("cannot seek on stderr or stdout");
-    }
-
-    fn close<'tcx>(
-        self: Box<Self>,
-        _communicate_allowed: bool,
-    ) -> InterpResult<'tcx, io::Result<i32>> {
-        throw_unsup_format!("stderr and stdout cannot be closed");
-    }
-
     fn dup<'tcx>(&mut self) -> io::Result<Box<dyn FileDescriptor>> {
         Ok(Box::new(DummyOutput))
-    }
-
-    #[cfg(unix)]
-    fn as_unix_host_fd(&self) -> Option<i32> {
-        None
     }
 }
 
@@ -520,6 +443,7 @@ pub struct DirHandler {
 }
 
 impl DirHandler {
+    #[allow(clippy::integer_arithmetic)]
     fn insert_new(&mut self, read_dir: ReadDir) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -741,17 +665,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         }
     }
 
-    fn close(&mut self, fd_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
+    fn close(&mut self, fd_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
 
         let fd = this.read_scalar(fd_op)?.to_i32()?;
 
-        if let Some(file_descriptor) = this.machine.file_handler.handles.remove(&fd) {
-            let result = file_descriptor.close(this.machine.communicate())?;
-            this.try_unwrap_io_result(result)
-        } else {
-            this.handle_not_found()
-        }
+        Ok(Scalar::from_i32(
+            if let Some(file_descriptor) = this.machine.file_handler.handles.remove(&fd) {
+                let result = file_descriptor.close(this.machine.communicate())?;
+                this.try_unwrap_io_result(result)?
+            } else {
+                this.handle_not_found()?
+            },
+        ))
     }
 
     fn read(
@@ -835,7 +761,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let communicate = this.machine.communicate();
 
         if let Some(file_descriptor) = this.machine.file_handler.handles.get(&fd) {
-            let bytes = this.read_bytes_ptr(buf, Size::from_bytes(count))?;
+            let bytes = this.read_bytes_ptr_strip_provenance(buf, Size::from_bytes(count))?;
             let result =
                 file_descriptor.write(communicate, bytes)?.map(|c| i64::try_from(c).unwrap());
             this.try_unwrap_io_result(result)
@@ -849,7 +775,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         fd_op: &OpTy<'tcx, Provenance>,
         offset_op: &OpTy<'tcx, Provenance>,
         whence_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i64> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
 
         // Isolation check is done via `FileDescriptor` trait.
@@ -867,18 +793,20 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         } else {
             let einval = this.eval_libc("EINVAL")?;
             this.set_last_error(einval)?;
-            return Ok(-1);
+            return Ok(Scalar::from_i64(-1));
         };
 
         let communicate = this.machine.communicate();
-        if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
-            let result = file_descriptor
-                .seek(communicate, seek_from)?
-                .map(|offset| i64::try_from(offset).unwrap());
-            this.try_unwrap_io_result(result)
-        } else {
-            this.handle_not_found()
-        }
+        Ok(Scalar::from_i64(
+            if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
+                let result = file_descriptor
+                    .seek(communicate, seek_from)?
+                    .map(|offset| i64::try_from(offset).unwrap());
+                this.try_unwrap_io_result(result)?
+            } else {
+                this.handle_not_found()?
+            },
+        ))
     }
 
     fn unlink(&mut self, path_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
@@ -932,7 +860,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         &mut self,
         path_op: &OpTy<'tcx, Provenance>,
         buf_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
         this.assert_target_os("macos", "stat");
 
@@ -944,16 +872,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             this.reject_in_isolation("`stat`", reject_with)?;
             let eacc = this.eval_libc("EACCES")?;
             this.set_last_error(eacc)?;
-            return Ok(-1);
+            return Ok(Scalar::from_i32(-1));
         }
 
         // `stat` always follows symlinks.
         let metadata = match FileMetadata::from_path(this, &path, true)? {
             Some(metadata) => metadata,
-            None => return Ok(-1),
+            None => return Ok(Scalar::from_i32(-1)), // `FileMetadata` has set errno
         };
 
-        this.macos_stat_write_buf(metadata, buf_op)
+        Ok(Scalar::from_i32(this.macos_stat_write_buf(metadata, buf_op)?))
     }
 
     // `lstat` is used to get symlink metadata.
@@ -961,7 +889,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         &mut self,
         path_op: &OpTy<'tcx, Provenance>,
         buf_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
         this.assert_target_os("macos", "lstat");
 
@@ -973,22 +901,22 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             this.reject_in_isolation("`lstat`", reject_with)?;
             let eacc = this.eval_libc("EACCES")?;
             this.set_last_error(eacc)?;
-            return Ok(-1);
+            return Ok(Scalar::from_i32(-1));
         }
 
         let metadata = match FileMetadata::from_path(this, &path, false)? {
             Some(metadata) => metadata,
-            None => return Ok(-1),
+            None => return Ok(Scalar::from_i32(-1)), // `FileMetadata` has set errno
         };
 
-        this.macos_stat_write_buf(metadata, buf_op)
+        Ok(Scalar::from_i32(this.macos_stat_write_buf(metadata, buf_op)?))
     }
 
     fn macos_fstat(
         &mut self,
         fd_op: &OpTy<'tcx, Provenance>,
         buf_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
 
         this.assert_target_os("macos", "fstat");
@@ -999,14 +927,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`fstat`", reject_with)?;
             // Set error code as "EBADF" (bad fd)
-            return this.handle_not_found();
+            return Ok(Scalar::from_i32(this.handle_not_found()?));
         }
 
         let metadata = match FileMetadata::from_fd(this, fd)? {
             Some(metadata) => metadata,
-            None => return Ok(-1),
+            None => return Ok(Scalar::from_i32(-1)),
         };
-        this.macos_stat_write_buf(metadata, buf_op)
+        Ok(Scalar::from_i32(this.macos_stat_write_buf(metadata, buf_op)?))
     }
 
     fn linux_statx(
@@ -1168,31 +1096,35 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             ],
             &statxbuf,
         )?;
-        this.write_int_fields(
+        #[rustfmt::skip]
+        this.write_int_fields_named(
             &[
-                access_sec.into(),  // stx_atime.tv_sec
-                access_nsec.into(), // stx_atime.tv_nsec
+                ("tv_sec", access_sec.into()),
+                ("tv_nsec", access_nsec.into()),
             ],
             &this.mplace_field_named(&statxbuf, "stx_atime")?,
         )?;
-        this.write_int_fields(
+        #[rustfmt::skip]
+        this.write_int_fields_named(
             &[
-                created_sec.into(),  // stx_btime.tv_sec
-                created_nsec.into(), // stx_btime.tv_nsec
+                ("tv_sec", created_sec.into()),
+                ("tv_nsec", created_nsec.into()),
             ],
             &this.mplace_field_named(&statxbuf, "stx_btime")?,
         )?;
-        this.write_int_fields(
+        #[rustfmt::skip]
+        this.write_int_fields_named(
             &[
-                0.into(), // stx_ctime.tv_sec
-                0.into(), // stx_ctime.tv_nsec
+                ("tv_sec", 0.into()),
+                ("tv_nsec", 0.into()),
             ],
             &this.mplace_field_named(&statxbuf, "stx_ctime")?,
         )?;
-        this.write_int_fields(
+        #[rustfmt::skip]
+        this.write_int_fields_named(
             &[
-                modified_sec.into(),  // stx_mtime.tv_sec
-                modified_nsec.into(), // stx_mtime.tv_nsec
+                ("tv_sec", modified_sec.into()),
+                ("tv_nsec", modified_nsec.into()),
             ],
             &this.mplace_field_named(&statxbuf, "stx_mtime")?,
         )?;
@@ -1379,12 +1311,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
                 let file_type = this.file_type_to_d_type(dir_entry.file_type())?;
 
-                this.write_int_fields(
+                this.write_int_fields_named(
                     &[
-                        ino.into(),       // d_ino
-                        0,                // d_off
-                        size.into(),      // d_reclen
-                        file_type.into(), // d_type
+                        ("d_ino", ino.into()),
+                        ("d_off", 0),
+                        ("d_reclen", size.into()),
+                        ("d_type", file_type.into()),
                     ],
                     &MPlaceTy::from_aligned_ptr(entry, dirent64_layout),
                 )?;
@@ -1416,7 +1348,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         dirp_op: &OpTy<'tcx, Provenance>,
         entry_op: &OpTy<'tcx, Provenance>,
         result_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
 
         this.assert_target_os("macos", "readdir_r");
@@ -1427,13 +1359,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`readdir_r`", reject_with)?;
             // Set error code as "EBADF" (bad fd)
-            return this.handle_not_found();
+            return Ok(Scalar::from_i32(this.handle_not_found()?));
         }
 
         let open_dir = this.machine.dir_handler.streams.get_mut(&dirp).ok_or_else(|| {
             err_unsup_format!("the DIR pointer passed to readdir_r did not come from opendir")
         })?;
-        match open_dir.read_dir.next() {
+        Ok(Scalar::from_i32(match open_dir.read_dir.next() {
             Some(Ok(dir_entry)) => {
                 // Write into entry, write pointer to result, return 0 on success.
                 // The name is written with write_os_str_to_c_str, while the rest of the
@@ -1453,11 +1385,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let name_place = this.mplace_field(&entry_place, 5)?;
 
                 let file_name = dir_entry.file_name(); // not a Path as there are no separators!
-                let (name_fits, file_name_len) = this.write_os_str_to_c_str(
+                let (name_fits, file_name_buf_len) = this.write_os_str_to_c_str(
                     &file_name,
                     name_place.ptr,
                     name_place.layout.size.bytes(),
                 )?;
+                let file_name_len = file_name_buf_len.checked_sub(1).unwrap();
                 if !name_fits {
                     throw_unsup_format!(
                         "a directory entry had a name too large to fit in libc::dirent"
@@ -1475,13 +1408,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
                 let file_type = this.file_type_to_d_type(dir_entry.file_type())?;
 
-                this.write_int_fields(
+                this.write_int_fields_named(
                     &[
-                        ino.into(),           // d_ino
-                        0,                    // d_seekoff
-                        0,                    // d_reclen
-                        file_name_len.into(), // d_namlen
-                        file_type.into(),     // d_type
+                        ("d_ino", ino.into()),
+                        ("d_seekoff", 0),
+                        ("d_reclen", 0),
+                        ("d_namlen", file_name_len.into()),
+                        ("d_type", file_type.into()),
                     ],
                     &entry_place,
                 )?;
@@ -1489,17 +1422,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let result_place = this.deref_operand(result_op)?;
                 this.write_scalar(this.read_scalar(entry_op)?, &result_place.into())?;
 
-                Ok(0)
+                0
             }
             None => {
                 // end of stream: return 0, assign *result=NULL
                 this.write_null(&this.deref_operand(result_op)?.into())?;
-                Ok(0)
+                0
             }
             Some(Err(e)) =>
                 match e.raw_os_error() {
                     // return positive error number on error
-                    Some(error) => Ok(error),
+                    Some(error) => error,
                     None => {
                         throw_unsup_format!(
                             "the error {} couldn't be converted to a return value",
@@ -1507,7 +1440,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         )
                     }
                 },
-        }
+        }))
     }
 
     fn closedir(&mut self, dirp_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
@@ -1535,7 +1468,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         &mut self,
         fd_op: &OpTy<'tcx, Provenance>,
         length_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
 
         let fd = this.read_scalar(fd_op)?.to_i32()?;
@@ -1545,30 +1478,32 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`ftruncate64`", reject_with)?;
             // Set error code as "EBADF" (bad fd)
-            return this.handle_not_found();
+            return Ok(Scalar::from_i32(this.handle_not_found()?));
         }
 
-        if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
-            // FIXME: Support ftruncate64 for all FDs
-            let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
-            if *writable {
-                if let Ok(length) = length.try_into() {
-                    let result = file.set_len(length);
-                    this.try_unwrap_io_result(result.map(|_| 0i32))
+        Ok(Scalar::from_i32(
+            if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
+                // FIXME: Support ftruncate64 for all FDs
+                let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
+                if *writable {
+                    if let Ok(length) = length.try_into() {
+                        let result = file.set_len(length);
+                        this.try_unwrap_io_result(result.map(|_| 0i32))?
+                    } else {
+                        let einval = this.eval_libc("EINVAL")?;
+                        this.set_last_error(einval)?;
+                        -1
+                    }
                 } else {
+                    // The file is not writable
                     let einval = this.eval_libc("EINVAL")?;
                     this.set_last_error(einval)?;
-                    Ok(-1)
+                    -1
                 }
             } else {
-                // The file is not writable
-                let einval = this.eval_libc("EINVAL")?;
-                this.set_last_error(einval)?;
-                Ok(-1)
-            }
-        } else {
-            this.handle_not_found()
-        }
+                this.handle_not_found()?
+            },
+        ))
     }
 
     fn fsync(&mut self, fd_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
@@ -1626,7 +1561,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         offset_op: &OpTy<'tcx, Provenance>,
         nbytes_op: &OpTy<'tcx, Provenance>,
         flags_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
 
         let fd = this.read_scalar(fd_op)?.to_i32()?;
@@ -1637,7 +1572,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         if offset < 0 || nbytes < 0 {
             let einval = this.eval_libc("EINVAL")?;
             this.set_last_error(einval)?;
-            return Ok(-1);
+            return Ok(Scalar::from_i32(-1));
         }
         let allowed_flags = this.eval_libc_i32("SYNC_FILE_RANGE_WAIT_BEFORE")?
             | this.eval_libc_i32("SYNC_FILE_RANGE_WRITE")?
@@ -1645,23 +1580,23 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         if flags & allowed_flags != flags {
             let einval = this.eval_libc("EINVAL")?;
             this.set_last_error(einval)?;
-            return Ok(-1);
+            return Ok(Scalar::from_i32(-1));
         }
 
         // Reject if isolation is enabled.
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`sync_file_range`", reject_with)?;
             // Set error code as "EBADF" (bad fd)
-            return this.handle_not_found();
+            return Ok(Scalar::from_i32(this.handle_not_found()?));
         }
 
         if let Some(file_descriptor) = this.machine.file_handler.handles.get(&fd) {
             // FIXME: Support sync_data_range for all FDs
             let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
             let io_result = maybe_sync_file(file, *writable, File::sync_data);
-            this.try_unwrap_io_result(io_result)
+            Ok(Scalar::from_i32(this.try_unwrap_io_result(io_result)?))
         } else {
-            this.handle_not_found()
+            Ok(Scalar::from_i32(this.handle_not_found()?))
         }
     }
 
@@ -1740,6 +1675,194 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let enotty = this.eval_libc("ENOTTY")?;
         this.set_last_error(enotty)?;
         Ok(0)
+    }
+
+    fn realpath(
+        &mut self,
+        path_op: &OpTy<'tcx, Provenance>,
+        processed_path_op: &OpTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
+        let this = self.eval_context_mut();
+        this.assert_target_os_is_unix("realpath");
+
+        let pathname = this.read_path_from_c_str(this.read_pointer(path_op)?)?;
+        let processed_ptr = this.read_pointer(processed_path_op)?;
+
+        // Reject if isolation is enabled.
+        if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
+            this.reject_in_isolation("`realpath`", reject_with)?;
+            let eacc = this.eval_libc("EACCES")?;
+            this.set_last_error(eacc)?;
+            return Ok(Scalar::from_machine_usize(0, this));
+        }
+
+        let result = std::fs::canonicalize(pathname);
+        match result {
+            Ok(resolved) => {
+                let path_max = this
+                    .eval_libc_i32("PATH_MAX")?
+                    .try_into()
+                    .expect("PATH_MAX does not fit in u64");
+                let dest = if this.ptr_is_null(processed_ptr)? {
+                    // POSIX says behavior when passing a null pointer is implementation-defined,
+                    // but GNU/linux, freebsd, netbsd, bionic/android, and macos all treat a null pointer
+                    // similarly to:
+                    //
+                    // "If resolved_path is specified as NULL, then realpath() uses
+                    // malloc(3) to allocate a buffer of up to PATH_MAX bytes to hold
+                    // the resolved pathname, and returns a pointer to this buffer.  The
+                    // caller should deallocate this buffer using free(3)."
+                    // <https://man7.org/linux/man-pages/man3/realpath.3.html>
+                    this.alloc_path_as_c_str(&resolved, MiriMemoryKind::C.into())?
+                } else {
+                    let (wrote_path, _) =
+                        this.write_path_to_c_str(&resolved, processed_ptr, path_max)?;
+
+                    if !wrote_path {
+                        // Note that we do not explicitly handle `FILENAME_MAX`
+                        // (different from `PATH_MAX` above) as it is Linux-specific and
+                        // seems like a bit of a mess anyway: <https://eklitzke.org/path-max-is-tricky>.
+                        let enametoolong = this.eval_libc("ENAMETOOLONG")?;
+                        this.set_last_error(enametoolong)?;
+                        return Ok(Scalar::from_machine_usize(0, this));
+                    }
+                    processed_ptr
+                };
+
+                Ok(Scalar::from_maybe_pointer(dest, this))
+            }
+            Err(e) => {
+                this.set_last_error_from_io_error(e.kind())?;
+                Ok(Scalar::from_machine_usize(0, this))
+            }
+        }
+    }
+    fn mkstemp(&mut self, template_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
+        use rand::seq::SliceRandom;
+
+        // POSIX defines the template string.
+        const TEMPFILE_TEMPLATE_STR: &str = "XXXXXX";
+
+        let this = self.eval_context_mut();
+        this.assert_target_os_is_unix("mkstemp");
+
+        // POSIX defines the maximum number of attempts before failure.
+        //
+        // `mkstemp()` relies on `tmpnam()` which in turn relies on `TMP_MAX`.
+        // POSIX says this about `TMP_MAX`:
+        // * Minimum number of unique filenames generated by `tmpnam()`.
+        // * Maximum number of times an application can call `tmpnam()` reliably.
+        //   * The value of `TMP_MAX` is at least 25.
+        //   * On XSI-conformant systems, the value of `TMP_MAX` is at least 10000.
+        // See <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/stdio.h.html>.
+        let max_attempts = this.eval_libc("TMP_MAX")?.to_u32()?;
+
+        // Get the raw bytes from the template -- as a byte slice, this is a string in the target
+        // (and the target is unix, so a byte slice is the right representation).
+        let template_ptr = this.read_pointer(template_op)?;
+        let mut template = this.eval_context_ref().read_c_str(template_ptr)?.to_owned();
+        let template_bytes = template.as_mut_slice();
+
+        // Reject if isolation is enabled.
+        if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
+            this.reject_in_isolation("`mkstemp`", reject_with)?;
+            let eacc = this.eval_libc("EACCES")?;
+            this.set_last_error(eacc)?;
+            return Ok(-1);
+        }
+
+        // Get the bytes of the suffix we expect in _target_ encoding.
+        let suffix_bytes = TEMPFILE_TEMPLATE_STR.as_bytes();
+
+        // At this point we have one `&[u8]` that represents the template and one `&[u8]`
+        // that represents the expected suffix.
+
+        // Now we figure out the index of the slice we expect to contain the suffix.
+        let start_pos = template_bytes.len().saturating_sub(suffix_bytes.len());
+        let end_pos = template_bytes.len();
+        let last_six_char_bytes = &template_bytes[start_pos..end_pos];
+
+        // If we don't find the suffix, it is an error.
+        if last_six_char_bytes != suffix_bytes {
+            let einval = this.eval_libc("EINVAL")?;
+            this.set_last_error(einval)?;
+            return Ok(-1);
+        }
+
+        // At this point we know we have 6 ASCII 'X' characters as a suffix.
+
+        // From <https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/sysdeps/posix/tempname.c#L175>
+        const SUBSTITUTIONS: &[char; 62] = &[
+            'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q',
+            'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
+            'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y',
+            'Z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+        ];
+
+        // The file is opened with specific options, which Rust does not expose in a portable way.
+        // So we use specific APIs depending on the host OS.
+        let mut fopts = OpenOptions::new();
+        fopts.read(true).write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fopts.mode(0o600);
+            // Do not allow others to read or modify this file.
+            fopts.custom_flags(libc::O_EXCL);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Do not allow others to read or modify this file.
+            fopts.share_mode(0);
+        }
+
+        // If the generated file already exists, we will try again `max_attempts` many times.
+        for _ in 0..max_attempts {
+            let rng = this.machine.rng.get_mut();
+
+            // Generate a random unique suffix.
+            let unique_suffix = SUBSTITUTIONS.choose_multiple(rng, 6).collect::<String>();
+
+            // Replace the template string with the random string.
+            template_bytes[start_pos..end_pos].copy_from_slice(unique_suffix.as_bytes());
+
+            // Write the modified template back to the passed in pointer to maintain POSIX semantics.
+            this.write_bytes_ptr(template_ptr, template_bytes.iter().copied())?;
+
+            // To actually open the file, turn this into a host OsString.
+            let p = bytes_to_os_str(template_bytes)?.to_os_string();
+
+            let possibly_unique = std::env::temp_dir().join::<PathBuf>(p.into());
+
+            let file = fopts.open(&possibly_unique);
+
+            match file {
+                Ok(f) => {
+                    let fh = &mut this.machine.file_handler;
+                    let fd = fh.insert_fd(Box::new(FileHandle { file: f, writable: true }));
+                    return Ok(fd);
+                }
+                Err(e) =>
+                    match e.kind() {
+                        // If the random file already exists, keep trying.
+                        ErrorKind::AlreadyExists => continue,
+                        // Any other errors are returned to the caller.
+                        _ => {
+                            // "On error, -1 is returned, and errno is set to
+                            // indicate the error"
+                            this.set_last_error_from_io_error(e.kind())?;
+                            return Ok(-1);
+                        }
+                    },
+            }
+        }
+
+        // We ran out of attempts to create the file, return an error.
+        let eexist = this.eval_libc("EEXIST")?;
+        this.set_last_error(eexist)?;
+        Ok(-1)
     }
 }
 

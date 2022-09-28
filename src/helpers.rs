@@ -23,24 +23,51 @@ use crate::*;
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriEvalContext<'mir, 'tcx> {}
 
-const UNIX_IO_ERROR_TABLE: &[(std::io::ErrorKind, &str)] = {
+// This mapping should match `decode_error_kind` in
+// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/unix/mod.rs>.
+const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
     use std::io::ErrorKind::*;
     &[
-        (ConnectionRefused, "ECONNREFUSED"),
-        (ConnectionReset, "ECONNRESET"),
-        (PermissionDenied, "EPERM"),
-        (BrokenPipe, "EPIPE"),
-        (NotConnected, "ENOTCONN"),
-        (ConnectionAborted, "ECONNABORTED"),
-        (AddrNotAvailable, "EADDRNOTAVAIL"),
-        (AddrInUse, "EADDRINUSE"),
-        (NotFound, "ENOENT"),
-        (Interrupted, "EINTR"),
-        (InvalidInput, "EINVAL"),
-        (TimedOut, "ETIMEDOUT"),
-        (AlreadyExists, "EEXIST"),
-        (WouldBlock, "EWOULDBLOCK"),
-        (DirectoryNotEmpty, "ENOTEMPTY"),
+        ("E2BIG", ArgumentListTooLong),
+        ("EADDRINUSE", AddrInUse),
+        ("EADDRNOTAVAIL", AddrNotAvailable),
+        ("EBUSY", ResourceBusy),
+        ("ECONNABORTED", ConnectionAborted),
+        ("ECONNREFUSED", ConnectionRefused),
+        ("ECONNRESET", ConnectionReset),
+        ("EDEADLK", Deadlock),
+        ("EDQUOT", FilesystemQuotaExceeded),
+        ("EEXIST", AlreadyExists),
+        ("EFBIG", FileTooLarge),
+        ("EHOSTUNREACH", HostUnreachable),
+        ("EINTR", Interrupted),
+        ("EINVAL", InvalidInput),
+        ("EISDIR", IsADirectory),
+        ("ELOOP", FilesystemLoop),
+        ("ENOENT", NotFound),
+        ("ENOMEM", OutOfMemory),
+        ("ENOSPC", StorageFull),
+        ("ENOSYS", Unsupported),
+        ("EMLINK", TooManyLinks),
+        ("ENAMETOOLONG", InvalidFilename),
+        ("ENETDOWN", NetworkDown),
+        ("ENETUNREACH", NetworkUnreachable),
+        ("ENOTCONN", NotConnected),
+        ("ENOTDIR", NotADirectory),
+        ("ENOTEMPTY", DirectoryNotEmpty),
+        ("EPIPE", BrokenPipe),
+        ("EROFS", ReadOnlyFilesystem),
+        ("ESPIPE", NotSeekable),
+        ("ESTALE", StaleNetworkFileHandle),
+        ("ETIMEDOUT", TimedOut),
+        ("ETXTBSY", ExecutableFileBusy),
+        ("EXDEV", CrossesDevices),
+        // The following have two valid options. We have both for the forwards mapping; only the
+        // first one will be used for the backwards mapping.
+        ("EPERM", PermissionDenied),
+        ("EACCES", PermissionDenied),
+        ("EWOULDBLOCK", WouldBlock),
+        ("EAGAIN", WouldBlock),
     ]
 };
 
@@ -89,8 +116,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let instance = this.resolve_path(path);
         let cid = GlobalId { instance, promoted: None };
         let const_val = this.eval_to_allocation(cid)?;
-        let const_val = this.read_scalar(&const_val.into())?;
-        const_val.check_init()
+        this.read_scalar(&const_val.into())
     }
 
     /// Helper function to get a `libc` constant as a `Scalar`.
@@ -540,7 +566,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     fn get_last_error(&mut self) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_mut();
         let errno_place = this.last_error_place()?;
-        this.read_scalar(&errno_place.into())?.check_init()
+        this.read_scalar(&errno_place.into())
     }
 
     /// This function tries to produce the most similar OS error from the `std::io::ErrorKind`
@@ -552,7 +578,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let this = self.eval_context_ref();
         let target = &this.tcx.sess.target;
         if target.families.iter().any(|f| f == "unix") {
-            for &(kind, name) in UNIX_IO_ERROR_TABLE {
+            for &(name, kind) in UNIX_IO_ERROR_TABLE {
                 if err_kind == kind {
                     return this.eval_libc(name);
                 }
@@ -582,20 +608,23 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     }
 
     /// The inverse of `io_error_to_errnum`.
-    fn errnum_to_io_error(
+    #[allow(clippy::needless_return)]
+    fn try_errnum_to_io_error(
         &self,
         errnum: Scalar<Provenance>,
-    ) -> InterpResult<'tcx, std::io::ErrorKind> {
+    ) -> InterpResult<'tcx, Option<std::io::ErrorKind>> {
         let this = self.eval_context_ref();
         let target = &this.tcx.sess.target;
         if target.families.iter().any(|f| f == "unix") {
             let errnum = errnum.to_i32()?;
-            for &(kind, name) in UNIX_IO_ERROR_TABLE {
+            for &(name, kind) in UNIX_IO_ERROR_TABLE {
                 if errnum == this.eval_libc_i32(name)? {
-                    return Ok(kind);
+                    return Ok(Some(kind));
                 }
             }
-            throw_unsup_format!("raw errnum {:?} cannot be translated into io::Error", errnum)
+            // Our table is as complete as the mapping in std, so we are okay with saying "that's a
+            // strange one" here.
+            return Ok(None);
         } else {
             throw_unsup_format!(
                 "converting errnum into io::Error is unsupported for OS {}",
@@ -650,22 +679,31 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         op: &OpTy<'tcx, Provenance>,
         offset: u64,
         layout: TyAndLayout<'tcx>,
-    ) -> InterpResult<'tcx, ScalarMaybeUninit<Provenance>> {
+    ) -> InterpResult<'tcx, Scalar<Provenance>> {
         let this = self.eval_context_ref();
         let value_place = this.deref_operand_and_offset(op, offset, layout)?;
         this.read_scalar(&value_place.into())
+    }
+
+    fn write_immediate_at_offset(
+        &mut self,
+        op: &OpTy<'tcx, Provenance>,
+        offset: u64,
+        value: &ImmTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx, ()> {
+        let this = self.eval_context_mut();
+        let value_place = this.deref_operand_and_offset(op, offset, value.layout)?;
+        this.write_immediate(**value, &value_place.into())
     }
 
     fn write_scalar_at_offset(
         &mut self,
         op: &OpTy<'tcx, Provenance>,
         offset: u64,
-        value: impl Into<ScalarMaybeUninit<Provenance>>,
+        value: impl Into<Scalar<Provenance>>,
         layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, ()> {
-        let this = self.eval_context_mut();
-        let value_place = this.deref_operand_and_offset(op, offset, layout)?;
-        this.write_scalar(value, &value_place.into())
+        self.write_immediate_at_offset(op, offset, &ImmTy::from_scalar(value.into(), layout))
     }
 
     /// Parse a `timespec` struct and return it as a `std::time::Duration`. It returns `None`
@@ -719,7 +757,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         }
 
         // Step 2: get the bytes.
-        this.read_bytes_ptr(ptr, len)
+        this.read_bytes_ptr_strip_provenance(ptr, len)
     }
 
     fn read_wide_str(&self, mut ptr: Pointer<Option<Provenance>>) -> InterpResult<'tcx, Vec<u16>> {
@@ -773,7 +811,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         // Fall back to the instance of the function itself.
         let instance = instance.unwrap_or(frame.instance);
         // Now check if this is in the same crate as start_fn.
-        this.tcx.def_path(instance.def_id()).krate == this.tcx.def_path(start_fn).krate
+        // As a special exception we also allow unit tests from
+        // <https://github.com/rust-lang/miri-test-libstd/tree/master/std_miri_test> to call these
+        // shims.
+        let frame_crate = this.tcx.def_path(instance.def_id()).krate;
+        frame_crate == this.tcx.def_path(start_fn).krate
+            || this.tcx.crate_name(frame_crate).as_str() == "std_miri_test"
     }
 
     /// Handler that should be called when unsupported functionality is encountered.
@@ -841,8 +884,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 }
 
 impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
-    pub fn current_span(&self) -> CurrentSpan<'_, 'mir, 'tcx> {
-        CurrentSpan { span: None, machine: self }
+    pub fn current_span(&self, tcx: TyCtxt<'tcx>) -> CurrentSpan<'_, 'mir, 'tcx> {
+        CurrentSpan { current_frame_idx: None, machine: self, tcx }
     }
 }
 
@@ -852,28 +895,63 @@ impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
 /// The result of that search is cached so that later calls are approximately free.
 #[derive(Clone)]
 pub struct CurrentSpan<'a, 'mir, 'tcx> {
-    span: Option<Span>,
+    current_frame_idx: Option<usize>,
+    tcx: TyCtxt<'tcx>,
     machine: &'a Evaluator<'mir, 'tcx>,
 }
 
-impl<'a, 'mir, 'tcx> CurrentSpan<'a, 'mir, 'tcx> {
+impl<'a, 'mir: 'a, 'tcx: 'a + 'mir> CurrentSpan<'a, 'mir, 'tcx> {
+    /// Get the current span, skipping non-local frames.
+    /// This function is backed by a cache, and can be assumed to be very fast.
     pub fn get(&mut self) -> Span {
-        *self.span.get_or_insert_with(|| Self::current_span(self.machine))
+        let idx = self.current_frame_idx();
+        Self::frame_span(self.machine, idx)
     }
 
+    /// Similar to `CurrentSpan::get`, but retrieves the parent frame of the first non-local frame.
+    /// This is useful when we are processing something which occurs on function-entry and we want
+    /// to point at the call to the function, not the function definition generally.
+    pub fn get_parent(&mut self) -> Span {
+        let idx = self.current_frame_idx();
+        Self::frame_span(self.machine, idx.wrapping_sub(1))
+    }
+
+    fn frame_span(machine: &Evaluator<'_, '_>, idx: usize) -> Span {
+        machine
+            .threads
+            .active_thread_stack()
+            .get(idx)
+            .map(Frame::current_span)
+            .unwrap_or(rustc_span::DUMMY_SP)
+    }
+
+    fn current_frame_idx(&mut self) -> usize {
+        *self
+            .current_frame_idx
+            .get_or_insert_with(|| Self::compute_current_frame_index(self.tcx, self.machine))
+    }
+
+    // Find the position of the inner-most frame which is part of the crate being
+    // compiled/executed, part of the Cargo workspace, and is also not #[track_caller].
     #[inline(never)]
-    fn current_span(machine: &Evaluator<'_, '_>) -> Span {
+    fn compute_current_frame_index(tcx: TyCtxt<'_>, machine: &Evaluator<'_, '_>) -> usize {
         machine
             .threads
             .active_thread_stack()
             .iter()
+            .enumerate()
             .rev()
-            .find(|frame| {
+            .find_map(|(idx, frame)| {
                 let def_id = frame.instance.def_id();
-                def_id.is_local() || machine.local_crates.contains(&def_id.krate)
+                if (def_id.is_local() || machine.local_crates.contains(&def_id.krate))
+                    && !frame.instance.def.requires_caller_location(tcx)
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
             })
-            .map(|frame| frame.current_span())
-            .unwrap_or(rustc_span::DUMMY_SP)
+            .unwrap_or(0)
     }
 }
 
@@ -919,5 +997,5 @@ pub fn get_local_crates(tcx: TyCtxt<'_>) -> Vec<CrateNum> {
 /// Helper function used inside the shims of foreign functions to check that
 /// `target_os` is a supported UNIX OS.
 pub fn target_os_is_unix(target_os: &str) -> bool {
-    matches!(target_os, "linux" | "macos" | "freebsd")
+    matches!(target_os, "linux" | "macos" | "freebsd" | "android")
 }

@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::fmt;
 use std::time::Instant;
 
@@ -11,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use rustc_ast::ast::Mutability;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 #[allow(unused)]
 use rustc_data_structures::static_assert_size;
 use rustc_middle::{
@@ -19,7 +18,7 @@ use rustc_middle::{
     ty::{
         self,
         layout::{LayoutCx, LayoutError, LayoutOf, TyAndLayout},
-        Instance, TyCtxt, TypeAndMut,
+        Instance, Ty, TyCtxt, TypeAndMut,
     },
 };
 use rustc_span::def_id::{CrateNum, DefId};
@@ -30,6 +29,7 @@ use rustc_target::spec::abi::Abi;
 use crate::{
     concurrency::{data_race, weak_memory},
     shims::unix::FileHandler,
+    shims::ffi_support::MachineBytes,
     *,
 };
 
@@ -127,7 +127,7 @@ impl fmt::Display for MiriMemoryKind {
 }
 
 /// Pointer provenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub enum Provenance {
     Concrete {
         alloc_id: AllocId,
@@ -135,23 +135,40 @@ pub enum Provenance {
         sb: SbTag,
     },
     Wildcard,
-    CHasAccess,
+}
+
+// This needs to be `Eq`+`Hash` because the `Machine` trait needs that because validity checking
+// *might* be recursive and then it has to track which places have already been visited.
+// However, comparing provenance is meaningless, since `Wildcard` might be any provenance -- and of
+// course we don't actually do recursive checking.
+// We could change `RefTracking` to strip provenance for its `seen` set but that type is generic so that is quite annoying.
+// Instead owe add the required instances but make them panic.
+impl PartialEq for Provenance {
+    fn eq(&self, _other: &Self) -> bool {
+        panic!("Provenance must not be compared")
+    }
+}
+impl Eq for Provenance {}
+impl std::hash::Hash for Provenance {
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
+        panic!("Provenance must not be hashed")
+    }
 }
 
 /// The "extra" information a pointer has over a regular AllocId.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum ProvenanceExtra {
     Concrete(SbTag),
     Wildcard,
 }
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(Pointer<Provenance>, 32);
+static_assert_size!(Pointer<Provenance>, 24);
 // FIXME: this would with in 24bytes but layout optimizations are not smart enough
 // #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 //static_assert_size!(Pointer<Option<Provenance>>, 24);
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(ScalarMaybeUninit<Provenance>, 40);
+static_assert_size!(Scalar<Provenance>, 32);
 
 impl interpret::Provenance for Provenance {
     /// We use absolute addresses in the `offset` of a `Pointer<Provenance>`.
@@ -178,9 +195,6 @@ impl interpret::Provenance for Provenance {
             Provenance::Wildcard => {
                 write!(f, "[wildcard]")?;
             }
-            Provenance::CHasAccess => {
-                write!(f, "[c has access]")?;
-            }
         }
 
         Ok(())
@@ -190,7 +204,21 @@ impl interpret::Provenance for Provenance {
         match self {
             Provenance::Concrete { alloc_id, .. } => Some(alloc_id),
             Provenance::Wildcard => None,
-            Provenance::CHasAccess => None,
+        }
+    }
+
+    fn join(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            // If both are the *same* concrete tag, that is the result.
+            (
+                Some(Provenance::Concrete { alloc_id: left_alloc, sb: left_sb }),
+                Some(Provenance::Concrete { alloc_id: right_alloc, sb: right_sb }),
+            ) if left_alloc == right_alloc && left_sb == right_sb => left,
+            // If one side is a wildcard, the best possible outcome is that it is equal to the other
+            // one, and we use that.
+            (Some(Provenance::Wildcard), o) | (o, Some(Provenance::Wildcard)) => o,
+            // Otherwise, fall back to `None`.
+            _ => None,
         }
     }
 }
@@ -224,7 +252,6 @@ pub struct AllocExtra {
     /// Weak memory emulation via the use of store buffers,
     ///  this is only added if it is enabled.
     pub weak_memory: Option<weak_memory::AllocExtra>,
-    pub real_pointer: *const u8,
 }
 
 /// Precomputed layouts of primitive types
@@ -239,13 +266,15 @@ pub struct PrimitiveLayouts<'tcx> {
     pub u32: TyAndLayout<'tcx>,
     pub usize: TyAndLayout<'tcx>,
     pub bool: TyAndLayout<'tcx>,
-    pub mut_raw_ptr: TyAndLayout<'tcx>,
+    pub mut_raw_ptr: TyAndLayout<'tcx>,   // *mut ()
+    pub const_raw_ptr: TyAndLayout<'tcx>, // *const ()
 }
 
 impl<'mir, 'tcx: 'mir> PrimitiveLayouts<'tcx> {
     fn new(layout_cx: LayoutCx<'tcx, TyCtxt<'tcx>>) -> Result<Self, LayoutError<'tcx>> {
         let tcx = layout_cx.tcx;
         let mut_raw_ptr = tcx.mk_ptr(TypeAndMut { ty: tcx.types.unit, mutbl: Mutability::Mut });
+        let const_raw_ptr = tcx.mk_ptr(TypeAndMut { ty: tcx.types.unit, mutbl: Mutability::Not });
         Ok(Self {
             unit: layout_cx.layout_of(tcx.mk_unit())?,
             i8: layout_cx.layout_of(tcx.types.i8)?,
@@ -258,6 +287,7 @@ impl<'mir, 'tcx: 'mir> PrimitiveLayouts<'tcx> {
             usize: layout_cx.layout_of(tcx.types.usize)?,
             bool: layout_cx.layout_of(tcx.types.bool)?,
             mut_raw_ptr: layout_cx.layout_of(mut_raw_ptr)?,
+            const_raw_ptr: layout_cx.layout_of(const_raw_ptr)?,
         })
     }
 }
@@ -341,7 +371,7 @@ pub struct Evaluator<'mir, 'tcx> {
 
     /// The allocation IDs to report when they are being allocated
     /// (helps for debugging memory leaks and use after free bugs).
-    tracked_alloc_ids: HashSet<AllocId>,
+    tracked_alloc_ids: FxHashSet<AllocId>,
 
     /// Controls whether alignment of memory accesses is being checked.
     pub(crate) check_alignment: AlignmentCheck,
@@ -360,15 +390,22 @@ pub struct Evaluator<'mir, 'tcx> {
 
     /// If `Some`, we will report the current stack every N basic blocks.
     pub(crate) report_progress: Option<u32>,
-    /// The number of blocks that passed since the last progress report.
-    pub(crate) since_progress_report: u32,
 
-    /// Handle of the optional C shared object file
+    // The total number of blocks that have been executed.
+    pub(crate) basic_block_count: u64,
+
+    /// Handle of the optional shared object file for external functions.
     pub external_so_lib: Option<(libloading::Library, std::path::PathBuf)>,
+
+    /// Run a garbage collector for SbTags every N basic blocks.
+    pub(crate) gc_interval: u32,
+    /// The number of blocks that passed since the last SbTag GC pass.
+    pub(crate) since_gc: u32,
 }
 
 impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
     pub(crate) fn new(config: &MiriConfig, layout_cx: LayoutCx<'tcx, TyCtxt<'tcx>>) -> Self {
+        let target_triple = &layout_cx.tcx.sess.opts.target_triple.to_string();
         let local_crates = helpers::get_local_crates(layout_cx.tcx);
         let layouts =
             PrimitiveLayouts::new(layout_cx).expect("Couldn't get layouts of primitive types");
@@ -418,19 +455,29 @@ impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
             weak_memory: config.weak_memory_emulation,
             preemption_rate: config.preemption_rate,
             report_progress: config.report_progress,
-            since_progress_report: 0,
+            basic_block_count: 0,
             external_so_lib: config.external_so_file.as_ref().map(|lib_file_path| {
+                // Check if host target == the session target.
+                if env!("TARGET") != target_triple {
+                    panic!(
+                        "calling external C functions in linked .so file requires host and target to be the same: host={}, target={}",
+                        env!("TARGET"),
+                        target_triple,
+                    );
+                }
                 // Note: it is the user's responsibility to provide a correct SO file.
                 // WATCH OUT: If an invalid/incorrect SO file is specified, this can cause
                 // undefined behaviour in Miri itself!
                 (
                     unsafe {
                         libloading::Library::new(lib_file_path)
-                            .expect("Failed to read specified shared object file")
+                            .expect("failed to read specified extern shared object file")
                     },
                     lib_file_path.clone(),
                 )
             }),
+            gc_interval: config.gc_interval,
+            since_gc: 0,
         }
     }
 
@@ -440,6 +487,7 @@ impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
     ) -> InterpResult<'tcx> {
         EnvVars::init(this, config)?;
         Evaluator::init_extern_statics(this)?;
+        ThreadManager::init(this);
         Ok(())
     }
 
@@ -451,6 +499,17 @@ impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
         // This got just allocated, so there definitely is a pointer here.
         let ptr = ptr.into_pointer_or_addr().unwrap();
         this.machine.extern_statics.try_insert(Symbol::intern(name), ptr).unwrap();
+    }
+
+    fn alloc_extern_static(
+        this: &mut MiriEvalContext<'mir, 'tcx>,
+        name: &str,
+        val: ImmTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx> {
+        let place = this.allocate(val.layout, MiriMemoryKind::ExternStatic.into())?;
+        this.write_immediate(*val, &place.into())?;
+        Self::add_extern_static(this, name, place.ptr);
+        Ok(())
     }
 
     /// Sets up the "extern statics" for this machine.
@@ -469,10 +528,8 @@ impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
                 // syscall that we do support).
                 for name in &["__cxa_thread_atexit_impl", "getrandom", "statx", "__clock_gettime64"]
                 {
-                    let layout = this.machine.layouts.usize;
-                    let place = this.allocate(layout, MiriMemoryKind::ExternStatic.into())?;
-                    this.write_scalar(Scalar::from_machine_usize(0, this), &place.into())?;
-                    Self::add_extern_static(this, name, place.ptr);
+                    let val = ImmTy::from_int(0, this.machine.layouts.usize);
+                    Self::alloc_extern_static(this, name, val)?;
                 }
             }
             "freebsd" => {
@@ -483,13 +540,27 @@ impl<'mir, 'tcx> Evaluator<'mir, 'tcx> {
                     this.machine.env_vars.environ.unwrap().ptr,
                 );
             }
+            "android" => {
+                // "signal"
+                let layout = this.machine.layouts.const_raw_ptr;
+                let dlsym = Dlsym::from_str("signal".as_bytes(), &this.tcx.sess.target.os)?
+                    .expect("`signal` must be an actual dlsym on android");
+                let ptr = this.create_fn_alloc_ptr(FnVal::Other(dlsym));
+                let val = ImmTy::from_scalar(Scalar::from_pointer(ptr, this), layout);
+                Self::alloc_extern_static(this, "signal", val)?;
+                // A couple zero-initialized pointer-sized extern statics.
+                // Most of them are for weak symbols, which we all set to null (indicating that the
+                // symbol is not supported, and triggering fallback code.)
+                for name in &["bsd_signal"] {
+                    let val = ImmTy::from_int(0, this.machine.layouts.usize);
+                    Self::alloc_extern_static(this, name, val)?;
+                }
+            }
             "windows" => {
                 // "_tls_used"
                 // This is some obscure hack that is part of the Windows TLS story. It's a `u8`.
-                let layout = this.machine.layouts.u8;
-                let place = this.allocate(layout, MiriMemoryKind::ExternStatic.into())?;
-                this.write_scalar(Scalar::from_u8(0), &place.into())?;
-                Self::add_extern_static(this, "_tls_used", place.ptr);
+                let val = ImmTy::from_int(0, this.machine.layouts.u8);
+                Self::alloc_extern_static(this, "_tls_used", val)?;
             }
             _ => {} // No "extern statics" supported on this target
         }
@@ -537,9 +608,11 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     type Provenance = Provenance;
     type ProvenanceExtra = ProvenanceExtra;
 
+    type Bytes = MachineBytes;
+
     type MemoryMap = MonoHashMap<
         AllocId,
-        (MemoryKind<MiriMemoryKind>, Allocation<Provenance, Self::AllocExtra>),
+        (MemoryKind<MiriMemoryKind>, Allocation<Provenance, Self::AllocExtra, Self::Bytes>),
     >;
 
     const GLOBAL_KIND: Option<MiriMemoryKind> = Some(MiriMemoryKind::Global);
@@ -552,18 +625,13 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     }
 
     #[inline(always)]
-    fn force_int_for_alignment_check(ecx: &MiriEvalContext<'mir, 'tcx>) -> bool {
+    fn use_addr_for_alignment_check(ecx: &MiriEvalContext<'mir, 'tcx>) -> bool {
         ecx.machine.check_alignment == AlignmentCheck::Int
     }
 
     #[inline(always)]
     fn enforce_validity(ecx: &MiriEvalContext<'mir, 'tcx>) -> bool {
         ecx.machine.validate
-    }
-
-    #[inline(always)]
-    fn enforce_number_init(_ecx: &MiriEvalContext<'mir, 'tcx>) -> bool {
-        true
     }
 
     #[inline(always)]
@@ -634,7 +702,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         bin_op: mir::BinOp,
         left: &ImmTy<'tcx, Provenance>,
         right: &ImmTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, (Scalar<Provenance>, bool, ty::Ty<'tcx>)> {
+    ) -> InterpResult<'tcx, (Scalar<Provenance>, bool, Ty<'tcx>)> {
         ecx.binary_ptr_op(bin_op, left, right)
     }
 
@@ -689,11 +757,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         id: AllocId,
         alloc: Cow<'b, Allocation>,
         kind: Option<MemoryKind<Self::MemoryKind>>,
-    ) -> InterpResult<'tcx, Cow<'b, Allocation<Self::Provenance, Self::AllocExtra>>> {
-        let size = alloc.size();
-        let alloc_range = AllocRange{ start: rustc_target::abi::Size::ZERO, size: size};
-        let alloc_bytes_ptr = alloc.get_bytes_with_uninit_and_ptr(ecx, alloc_range).unwrap().as_ptr();
- 
+    ) -> InterpResult<'tcx, Cow<'b, Allocation<Self::Provenance, Self::AllocExtra, MachineBytes>>> {
         let kind = kind.expect("we set our STATIC_KIND so this cannot be None");
         if ecx.machine.tracked_alloc_ids.contains(&id) {
             register_diagnostic(NonHaltingDiagnostic::CreatedAlloc(
@@ -711,7 +775,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
                 alloc.size(),
                 stacked_borrows,
                 kind,
-                ecx.machine.current_span(),
+                ecx.machine.current_span(*ecx.tcx),
             )
         });
         let race_alloc = ecx.machine.data_race.as_ref().map(|data_race| {
@@ -723,13 +787,12 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
             )
         });
         let buffer_alloc = ecx.machine.weak_memory.then(weak_memory::AllocExtra::new_allocation);
-        let alloc: Allocation<Provenance, Self::AllocExtra> = alloc.adjust_from_tcx(
+        let alloc: Allocation<Provenance, Self::AllocExtra, MachineBytes> = alloc.adjust_from_tcx(
             &ecx.tcx,
             AllocExtra {
                 stacked_borrows: stacks.map(RefCell::new),
                 data_race: race_alloc,
                 weak_memory: buffer_alloc,
-                real_pointer: alloc_bytes_ptr,
             },
             |ptr| ecx.global_base_pointer(ptr),
         )?;
@@ -781,7 +844,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         match ptr.provenance {
             Provenance::Concrete { alloc_id, sb } =>
                 intptrcast::GlobalStateInner::expose_ptr(ecx, alloc_id, sb),
-            Provenance::Wildcard | Provenance::CHasAccess => {
+            Provenance::Wildcard => {
                 // No need to do anything for wildcard pointers as
                 // their provenances have already been previously exposed.
                 Ok(())
@@ -800,15 +863,15 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         rel.map(|(alloc_id, size)| {
             let sb = match ptr.provenance {
                 Provenance::Concrete { sb, .. } => ProvenanceExtra::Concrete(sb),
-                Provenance::Wildcard | Provenance::CHasAccess => ProvenanceExtra::Wildcard,
+                Provenance::Wildcard => ProvenanceExtra::Wildcard,
             };
             (alloc_id, size, sb)
         })
     }
 
     #[inline(always)]
-    fn memory_read(
-        _tcx: TyCtxt<'tcx>,
+    fn before_memory_read(
+        tcx: TyCtxt<'tcx>,
         machine: &Self,
         alloc_extra: &AllocExtra,
         (alloc_id, prov_extra): (AllocId, Self::ProvenanceExtra),
@@ -823,12 +886,12 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
             )?;
         }
         if let Some(stacked_borrows) = &alloc_extra.stacked_borrows {
-            stacked_borrows.borrow_mut().memory_read(
+            stacked_borrows.borrow_mut().before_memory_read(
                 alloc_id,
                 prov_extra,
                 range,
                 machine.stacked_borrows.as_ref().unwrap(),
-                machine.current_span(),
+                machine.current_span(tcx),
                 &machine.threads,
             )?;
         }
@@ -839,8 +902,8 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     }
 
     #[inline(always)]
-    fn memory_written(
-        _tcx: TyCtxt<'tcx>,
+    fn before_memory_write(
+        tcx: TyCtxt<'tcx>,
         machine: &mut Self,
         alloc_extra: &mut AllocExtra,
         (alloc_id, prov_extra): (AllocId, Self::ProvenanceExtra),
@@ -855,12 +918,12 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
             )?;
         }
         if let Some(stacked_borrows) = &mut alloc_extra.stacked_borrows {
-            stacked_borrows.get_mut().memory_written(
+            stacked_borrows.get_mut().before_memory_write(
                 alloc_id,
                 prov_extra,
                 range,
                 machine.stacked_borrows.as_ref().unwrap(),
-                machine.current_span(),
+                machine.current_span(tcx),
                 &machine.threads,
             )?;
         }
@@ -871,8 +934,8 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     }
 
     #[inline(always)]
-    fn memory_deallocated(
-        _tcx: TyCtxt<'tcx>,
+    fn before_memory_deallocation(
+        tcx: TyCtxt<'tcx>,
         machine: &mut Self,
         alloc_extra: &mut AllocExtra,
         (alloc_id, prove_extra): (AllocId, Self::ProvenanceExtra),
@@ -890,11 +953,12 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
             )?;
         }
         if let Some(stacked_borrows) = &mut alloc_extra.stacked_borrows {
-            stacked_borrows.get_mut().memory_deallocated(
+            stacked_borrows.get_mut().before_memory_deallocation(
                 alloc_id,
                 prove_extra,
                 range,
                 machine.stacked_borrows.as_ref().unwrap(),
+                machine.current_span(tcx),
                 &machine.threads,
             )
         } else {
@@ -954,15 +1018,26 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     }
 
     fn before_terminator(ecx: &mut InterpCx<'mir, 'tcx, Self>) -> InterpResult<'tcx> {
+        ecx.machine.basic_block_count += 1u64; // a u64 that is only incremented by 1 will "never" overflow
+        ecx.machine.since_gc += 1;
         // Possibly report our progress.
         if let Some(report_progress) = ecx.machine.report_progress {
-            if ecx.machine.since_progress_report >= report_progress {
-                register_diagnostic(NonHaltingDiagnostic::ProgressReport);
-                ecx.machine.since_progress_report = 0;
+            if ecx.machine.basic_block_count % u64::from(report_progress) == 0 {
+                register_diagnostic(NonHaltingDiagnostic::ProgressReport {
+                    block_count: ecx.machine.basic_block_count,
+                });
             }
-            // Cannot overflow, since it is strictly less than `report_progress`.
-            ecx.machine.since_progress_report += 1;
         }
+
+        // Search for SbTags to find all live pointers, then remove all other tags from borrow
+        // stacks.
+        // When debug assertions are enabled, run the GC as often as possible so that any cases
+        // where it mistakenly removes an important tag become visible.
+        if ecx.machine.gc_interval > 0 && ecx.machine.since_gc >= ecx.machine.gc_interval {
+            ecx.machine.since_gc = 0;
+            ecx.garbage_collect_tags()?;
+        }
+
         // These are our preemption points.
         ecx.maybe_preempt_active_thread();
         Ok(())

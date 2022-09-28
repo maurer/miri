@@ -1,80 +1,353 @@
-use libffi::{high::call::*, low::CodePtr};
-use std::ops::Deref;
+use libffi::{high::call as ffi, low::CodePtr};
+use std::ops::{Deref, Range};
+use std::mem::MaybeUninit;
+use std::borrow::Cow;
+use std::hash;
 
-use rustc_middle::ty::{IntTy, Ty, TypeAndMut, TyKind, UintTy};
+use rustc_data_structures::stable_hasher::{StableHasher, HashStable};
+
+use rustc_macros::{TyDecodable, TyEncodable, HashStable};
+
+use rustc_middle::ty::{self as ty, IntTy, Ty, TyKind, TypeAndMut, UintTy};
+use rustc_middle::ty::layout::LayoutOf;
+use rustc_middle::mir::interpret::AllocBytes;
 use rustc_span::Symbol;
-use rustc_target::abi::HasDataLayout;
+use rustc_target::abi::{Align, Size, HasDataLayout};
 
 use crate::*;
 
-// pub trait HasUnderlyingPointer {
-//     fn get_underlying_raw_ptr(&self) -> *const u8;
-// }
+/// Representation of a section of memory, starting at a particular
+/// address and of a specified length.
+/// This is how we represent bytes in an `Allocation` that can't be 
+/// owned, since they belong to a foreign process -- in particular, we
+/// use this to store pointers to C memory passed back from C FFI calls 
+/// in Miri.
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(TyEncodable, TyDecodable)]
+pub struct AddrAllocBytes {
+    /// Address of the beginning of the bytes.
+    pub addr: u64,
+    /// Size of the type of the data being stored in these bytes.
+    pub type_size: usize,
+    /// Length of the bytes, in multiples of `type_size`; 
+    /// it's in a `RefCell` since it can change depending on how it's used
+    /// in the program. UNSAFE
+    pub len: std::cell::RefCell<usize>,
+}
 
-// impl HasUnderlyingPointer for Allocation {
-//     fn get_underlying_raw_ptr(&self) -> *const u8 {
+impl AddrAllocBytes {
+    /// Length of the bytes.
+    pub fn total_len(&self) -> usize {
+        self.type_size * *self.len.borrow()
+    }
+}
+
+// Satisfy the `Hash` and `HashStable` trait requirements; can't be automatically derived.
+impl hash::Hash for AddrAllocBytes {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+        self.type_size.hash(state);
+    }
+}   
+impl<CTX> HashStable<CTX> for AddrAllocBytes {
+    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+        self.addr.hash_stable(hcx, hasher);
+        self.type_size.hash_stable(hcx, hasher);
+    }
+}
+
+// Types that can be used to represent the `bytes field of an `Allocation`. 
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[derive(TyEncodable, TyDecodable)]
+#[derive(HashStable)]
+pub enum MachineBytes {
+    /// Owned, boxed slice of [u8].
+    Boxed(Box<[u8]>),
+    /// Address, size of the type stored, and length of the allocation.
+    /// This is used for representing pointers to bytes that belong to a 
+    /// foreign process (such as pointers into C memory, passed back to Rust
+    /// through an FFI call).
+    Addr(AddrAllocBytes),
+}
+
+
+
+    // pub fn from_raw_addr(
+    //     addr: u64,
+    //     type_size: usize,
+    //     len: usize,
+    //     align: Align,
+    //     mutability: Mutability,
+    // ) -> Self {
+    //     let addr_alloc_bytes = AddrAllocBytes { addr, type_size, len: std::cell::RefCell::new(len)};
+    //     let size = Size::from_bytes(addr_alloc_bytes.total_len());
+    //     Self {
+    //         bytes: AllocBytes::Addr(addr_alloc_bytes),
+    //         relocations: Relocations::new(),
+    //         init_mask: InitMask::new(size, true),
+    //         align,
+    //         mutability,
+    //         extra: (),
+    //     }
+    // }
+
+impl AllocBytes for MachineBytes {
+
+    fn adjust_to_align(self, _align: Align) -> Self {
+        let len = self.get_len();
+        match self {
+            Self::Boxed(b) => {
+                let align_usize: usize = _align.bytes().try_into().unwrap();
+                let layout = std::alloc::Layout::from_size_align(len, align_usize).unwrap();
+                let mut bytes = unsafe {
+                    let buf = std::alloc::alloc(layout);
+                    let mut boxed = Box::<[MaybeUninit<u8>]>::from_raw(std::slice::from_raw_parts_mut(buf as *mut MaybeUninit<u8>, len));
+                    MachineBytes::write_maybe_uninit_slice(&mut boxed, &self);
+                    boxed.assume_init()
+                };
+                assert!(bytes.as_ptr() as usize % align_usize == 0);
+                Self::Boxed(bytes)
+            },
+            Self::Addr(_) => self
+        }
         
-//     }
-// } 
+    }
+
+    fn uninit<'tcx, F: Fn() -> InterpError<'tcx>>(size: Size, align: Align, handle_alloc_fail: F) -> Result<Self, InterpError<'tcx>> {
+        let align_usize: usize = align.bytes().try_into().unwrap();
+        let layout = std::alloc::Layout::from_size_align(size.bytes_usize(), align_usize).unwrap();
+        let vec_align = unsafe {
+            // https://doc.rust-lang.org/nightly/std/alloc/trait.GlobalAlloc.html#tymethod.alloc
+            // std::alloc::alloc returns null to indicate an allocation failure: 
+            // "Returning a null pointer indicates that either memory is exhausted 
+            // or layout does not meet this allocator’s size or alignment constraints."
+            let buf = std::alloc::alloc(layout);
+            // Handle allocation failure.
+            if buf.is_null() {
+                return Err(handle_alloc_fail())
+            } 
+            Vec::from_raw_parts(buf as *mut u8, size.bytes_usize(), size.bytes_usize())
+        };
+        
+        let bytes = vec_align.into_boxed_slice();
+        assert!(bytes.as_ptr() as u64 % align.bytes() == 0);
+        Ok(Self::Boxed(bytes))
+    }
+
+    fn from_bytes<'tcx>(slice: impl Into<Cow<'tcx, [u8]>>, _align: Align) -> Self {
+        let slice: Cow<'tcx, [u8]> = slice.into();
+        let align_usize: usize = _align.bytes().try_into().unwrap();
+        let layout = std::alloc::Layout::from_size_align(slice.len(), align_usize).unwrap();
+        let bytes = unsafe {
+            let buf = std::alloc::alloc(layout);
+            let mut boxed = Box::<[MaybeUninit<u8>]>::from_raw(std::slice::from_raw_parts_mut(buf as *mut MaybeUninit<u8>, slice.len()));
+            MaybeUninit::write_slice(&mut boxed, &slice);
+            boxed.assume_init()
+        };
+        
+        assert!(bytes.as_ptr() as u64 % _align.bytes() == 0);
+        Self::Boxed(bytes)
+    }
+
+    /// The length of the bytes.
+    fn get_len(&self) -> usize {
+        match self {
+            Self::Boxed(b) => b.len(),
+            Self::Addr(addr_alloc_bytes) => addr_alloc_bytes.total_len(),
+        }
+    }
+
+    /// The real address of the bytes.
+    fn expose_addr(&self) -> u64 {
+        match self {
+            Self::Boxed(b) => b.as_ptr() as u64,
+            Self::Addr(AddrAllocBytes{ addr, ..}) => *addr,
+        }
+    }
+
+    /// Slice of the bytes, for a specified range.
+    fn get_slice_from_range(&self, range: Range<usize>) -> &[u8] {
+        match &self {
+            Self::Boxed(b) => &b[range],
+            Self::Addr(AddrAllocBytes { addr, type_size, len }) => {
+                unsafe {
+                    let addr = *addr as *const u8;
+                    let max_len = range.end;
+                    let mut cur_len = len.borrow_mut();
+                    if max_len/(*type_size) > *cur_len {
+                        *cur_len = max_len/(*type_size);
+                    }
+                    let whole_slice = std::slice::from_raw_parts(addr, (*type_size)*(*cur_len));
+                    &whole_slice[range]
+                }
+            }
+        }
+    }
+
+    /// Mutable slice of the bytes, for a specified range.
+    fn get_slice_from_range_mut<'a>(&'a mut self, range: Range<usize>) -> &'a mut [u8]{
+        match self {
+            Self::Boxed(ref mut b) => &mut b[range],
+            Self::Addr(AddrAllocBytes{..}) => {
+                // TODO! Should this be allowed?
+                todo!();
+            }
+        }
+    }
+
+    /// Pointer addition to the base address of the bytes.
+    fn add_ptr(&mut self, to_add: usize) -> *mut u8 {
+        match self {
+            Self::Boxed(b) => {
+                b.as_mut_ptr().wrapping_add(to_add)
+            },
+            Self::Addr(AddrAllocBytes{..}) => {
+                // TODO! Should this be allowed?
+                todo!();
+            }
+        }
+    }
+}
+
+impl MachineBytes {
+
+    /// Write an `AllocBytes` to a boxed slice of `MaybeUninit` -- this serves to initialize 
+    /// the elements in `boxed`, for the length of the `AllocBytes` passed in.
+    pub fn write_maybe_uninit_slice(boxed: &mut Box<[MaybeUninit<u8>]>, to_write: &Self) {
+        match to_write {
+            Self::Boxed(ref b) => {
+                MaybeUninit::write_slice(boxed, &b);
+            },
+            Self::Addr(AddrAllocBytes{addr, ..}) => {
+                unsafe {
+                    let addr = *addr as *const u8;
+                    let boxed_len = boxed.len();
+                    MaybeUninit::write_slice(boxed, std::slice::from_raw_parts(addr, boxed_len));
+                }
+            }
+        }
+    }
+}
+
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriEvalContext<'mir, 'tcx> {}
 
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx> {
 
-    // fn get_allocation_for_id(&self, id: AllocId) -> InterpResult<'tcx, &Allocation<Provenance, AllocExtra>> {
-    //     let this = self.eval_context_ref();
-    //     this.get_alloc_raw(id)
-    // }
+    const C_POINTER_DEFAULT_LEN: usize = 1000;
 
     /// Extract the scalar value from the result of reading a scalar from the machine,
     /// and convert it to a `CArg`.
     fn scalar_to_carg(
-        k: ScalarMaybeUninit<Provenance>,
-        arg_type: &Ty<'tcx>,
-        cx: &MiriEvalContext<'mir, 'tcx>,
+        k: Scalar<Provenance>,
+        arg_type: Ty<'tcx>,
+        cx: &mut MiriEvalContext<'mir, 'tcx>,
     ) -> InterpResult<'tcx, CArg> {
         match arg_type.kind() {
             // If the primitive provided can be converted to a type matching the type pattern
             // then create a `CArg` of this primitive value with the corresponding `CArg` constructor.
             // the ints
-            TyKind::Int(IntTy::I8) => {
+            ty::Int(IntTy::I8) => {
                 return Ok(CArg::Int8(k.to_i8()?));
             }
-            TyKind::Int(IntTy::I16) => {
+            ty::Int(IntTy::I16) => {
                 return Ok(CArg::Int16(k.to_i16()?));
             }
-            TyKind::Int(IntTy::I32) => {
+            ty::Int(IntTy::I32) => {
                 return Ok(CArg::Int32(k.to_i32()?));
             }
-            TyKind::Int(IntTy::I64) => {
+            ty::Int(IntTy::I64) => {
                 return Ok(CArg::Int64(k.to_i64()?));
             }
-            TyKind::Int(IntTy::Isize) => {
+            ty::Int(IntTy::Isize) => {
+                // This will fail if host != target, but then the entire FFI thing probably won't work well
+                // in that situation.
                 return Ok(CArg::ISize(k.to_machine_isize(cx)?.try_into().unwrap()));
             }
             // the uints
-            TyKind::Uint(UintTy::U8) => {
+            ty::Uint(UintTy::U8) => {
                 return Ok(CArg::UInt8(k.to_u8()?));
             }
-            TyKind::Uint(UintTy::U16) => {
+            ty::Uint(UintTy::U16) => {
                 return Ok(CArg::UInt16(k.to_u16()?));
             }
-            TyKind::Uint(UintTy::U32) => {
+            ty::Uint(UintTy::U32) => {
                 return Ok(CArg::UInt32(k.to_u32()?));
             }
-            TyKind::Uint(UintTy::U64) => {
+            ty::Uint(UintTy::U64) => {
                 return Ok(CArg::UInt64(k.to_u64()?));
             }
-            TyKind::Uint(UintTy::Usize) => {
+            ty::Uint(UintTy::Usize) => {
+                // This will fail if host != target, but then the entire FFI thing probably won't work well
+                // in that situation.
                 return Ok(CArg::USize(k.to_machine_usize(cx)?.try_into().unwrap()));
             }
             // pointers
-            TyKind::RawPtr(TypeAndMut{..} ) => {
+            ty::RawPtr(TypeAndMut { ty: some_ty, mutbl: some_mut }) => {
                 match k {
-                    ScalarMaybeUninit::Scalar(Scalar::Ptr(ptr, sz)) => {
+                    Scalar::Ptr(mut ptr, ofs) => {
+                        machine::Evaluator::<'mir, 'tcx>::expose_ptr(cx, ptr)?;
+                        
                         let qq = ptr.into_parts().1.bytes_usize();
-                        // TODO select correct types rather than yoloing
-                        return Ok(CArg::RecConstPtrCarg(Box::new(CArg::ConstPtrInt32(qq as *const i32))))
+                        match (some_ty.kind(), some_mut) {
+                            // int
+                            (ty::Int(IntTy::I8), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrInt8(qq as *mut i8));
+                            }
+                            (ty::Int(IntTy::I8), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrInt8(qq as *const i8));
+                            }
+                            (ty::Int(IntTy::I16), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrInt16(qq as *mut i16));
+                            }
+                            (ty::Int(IntTy::I16), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrInt16(qq as *const i16));
+                            }
+                            (ty::Int(IntTy::I32), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrInt32(qq as *mut i32));
+                            }
+                            (ty::Int(IntTy::I32), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrInt32(qq as *const i32));
+                            }
+                            (ty::Int(IntTy::I64), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrInt64(qq as *mut i64));
+                            }
+                            (ty::Int(IntTy::I64), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrInt64(qq as *const i64));
+                            }
+                            // uints
+                            (ty::Uint(UintTy::U8), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrUInt8(qq as *mut u8));
+                            }
+                            (ty::Uint(UintTy::U8), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrUInt8(qq as *const u8));
+                            }
+                            (ty::Uint(UintTy::U16), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrUInt16(qq as *mut u16));
+                            }
+                            (ty::Uint(UintTy::U16), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrUInt16(qq as *const u16));
+                            }
+                            (ty::Uint(UintTy::U32), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrUInt32(qq as *mut u32));
+                            }
+                            (ty::Uint(UintTy::U32), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrUInt32(qq as *const u32));
+                            }
+                            (ty::Uint(UintTy::U64), rustc_hir::Mutability::Mut) => {
+                                return Ok(CArg::MutPtrUInt64(qq as *mut u64));
+                            }
+                            (ty::Uint(UintTy::U64), rustc_hir::Mutability::Not) => {
+                                return Ok(CArg::ConstPtrUInt64(qq as *const u64));
+                            }
+                            // recursive case
+                            (ty::RawPtr(..), _) => {
+                                return Ok(CArg::RecCarg(Box::new(Self::scalar_to_carg(
+                                    k, *some_ty, cx,
+                                )?)));
+                            }
+                            _ => {}
+                        }
                     }
                     _ => {}
                 }
@@ -108,83 +381,150 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             // primitive integer type, and then write this value out to the miri memory as an integer.
             match dest.layout.ty.kind() {
                 // ints
-                TyKind::Int(IntTy::I8) => {
-                    let x = call::<i8>(ptr, libffi_args.as_slice());
+                ty::Int(IntTy::I8) => {
+                    let x = ffi::call::<i8>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Int(IntTy::I16) => {
-                    let x = call::<i16>(ptr, libffi_args.as_slice());
+                ty::Int(IntTy::I16) => {
+                    let x = ffi::call::<i16>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Int(IntTy::I32) => {
-                    let x = call::<i32>(ptr, libffi_args.as_slice());
+                ty::Int(IntTy::I32) => {
+                    let x = ffi::call::<i32>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Int(IntTy::I64) => {
-                    let x = call::<i64>(ptr, libffi_args.as_slice());
+                ty::Int(IntTy::I64) => {
+                    let x = ffi::call::<i64>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Int(IntTy::Isize) => {
-                    let x = call::<isize>(ptr, libffi_args.as_slice());
+                ty::Int(IntTy::Isize) => {
+                    let x = ffi::call::<isize>(ptr, libffi_args.as_slice());
                     // `isize` doesn't `impl Into<i128>`, so convert manually.
                     // Convert to `i64` since this covers both 32- and 64-bit machines.
                     this.write_int(i64::try_from(x).unwrap(), dest)?;
                     return Ok(());
                 }
                 // uints
-                TyKind::Uint(UintTy::U8) => {
-                    let x = call::<u8>(ptr, libffi_args.as_slice());
+                ty::Uint(UintTy::U8) => {
+                    let x = ffi::call::<u8>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Uint(UintTy::U16) => {
-                    let x = call::<u16>(ptr, libffi_args.as_slice());
+                ty::Uint(UintTy::U16) => {
+                    let x = ffi::call::<u16>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Uint(UintTy::U32) => {
-                    let x = call::<u32>(ptr, libffi_args.as_slice());
+                ty::Uint(UintTy::U32) => {
+                    let x = ffi::call::<u32>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Uint(UintTy::U64) => {
-                    let x = call::<u64>(ptr, libffi_args.as_slice());
+                ty::Uint(UintTy::U64) => {
+                    let x = ffi::call::<u64>(ptr, libffi_args.as_slice());
                     this.write_int(x, dest)?;
                     return Ok(());
                 }
-                TyKind::Uint(UintTy::Usize) => {
-                    let x = call::<usize>(ptr, libffi_args.as_slice());
+                ty::Uint(UintTy::Usize) => {
+                    let x = ffi::call::<usize>(ptr, libffi_args.as_slice());
                     // `usize` doesn't `impl Into<i128>`, so convert manually.
                     // Convert to `u64` since this covers both 32- and 64-bit machines.
                     this.write_int(u64::try_from(x).unwrap(), dest)?;
                     return Ok(());
                 }
-                // mut pointers
-                TyKind::RawPtr(TypeAndMut{ ty: some_ty, mutbl: rustc_hir::Mutability::Mut} ) => {
-                    match some_ty.kind() {
-                        TyKind::Int(IntTy::I32) => {
-                            println!("REEEE ");
-                            // let x = call::<i32>(ptr, libffi_args.as_slice());
-                            // this.write_int(x, dest)?;
-                            return Ok(());
-                        },
-                        _ => { }
+                // pointers
+                ty::RawPtr(TypeAndMut{ ty: some_ty, mutbl } ) => {
+                    // FIXME! Eventually, don't just use a giant allocation for C pointers.
+                    let len = Self::C_POINTER_DEFAULT_LEN;
+                    let align = 1;
+                    if let Some((raw_addr, type_size)) = 
+                        match some_ty.kind() {
+                            ty::Int(IntTy::I8) => {
+                                let raw_addr = ffi::call::<*mut i8>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i8>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Int(IntTy::I16) => {
+                                let raw_addr = ffi::call::<*mut i16>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i16>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Int(IntTy::I32) => {
+                                let raw_addr = ffi::call::<*mut i32>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i32>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Int(IntTy::I64) => {
+                                let raw_addr = ffi::call::<*mut i64>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<i64>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Int(IntTy::Isize) => {
+                                let raw_addr = ffi::call::<*mut isize>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<isize>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Uint(UintTy::U8) => {
+                                let raw_addr = ffi::call::<*mut u8>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u8>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Uint(UintTy::U16) => {
+                                let raw_addr = ffi::call::<*mut u16>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u16>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Uint(UintTy::U32) => {
+                                let raw_addr = ffi::call::<*mut u32>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u32>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Uint(UintTy::U64) => {
+                                let raw_addr = ffi::call::<*mut u64>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<u64>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            ty::Uint(UintTy::Usize) => {
+                                let raw_addr = ffi::call::<*mut usize>(ptr, libffi_args.as_slice());
+                                let type_size = std::mem::size_of::<usize>();
+                                Some((raw_addr as u64, type_size))
+                            },
+                            _ => { None }
+                        } {
+                        let mut ptr = this.allocate_ptr_raw_addr(
+                            raw_addr,
+                            type_size,
+                            len,
+                            Align::from_bytes(align).unwrap(),
+                            *mutbl,
+                            MiriMemoryKind::C.into(),
+                        );
+                        match ptr.provenance {
+                            Provenance::Concrete { alloc_id, sb } => {
+                                intptrcast::GlobalStateInner::expose_ptr(this, alloc_id, sb)?;
+                                ptr.provenance = Provenance::Wildcard;
+                            }
+                            Provenance::Wildcard => {
+                            }
+                        }
+                        this.write_pointer(ptr, dest)?;
+                        return Ok(());
                     }
                 }
                 // Functions with no declared return type (i.e., the default return)
                 // have the output_type `Tuple([])`.
-                TyKind::Tuple(t_list) =>
+                ty::Tuple(t_list) =>
                     if t_list.len() == 0 {
-                        call::<()>(ptr, libffi_args.as_slice());
+                        ffi::call::<()>(ptr, libffi_args.as_slice());
                         return Ok(());
                     },
                 _ => {}
             }
-            // TODO ellen! deal with all the other return types
+            // FIXME ellen! deal with all the other return types
             throw_unsup_format!("unsupported return type to external C function: {:?}", link_name);
         }
     }
@@ -239,7 +579,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     /// a form compatible with C (through `libffi` call).
     /// Then, convert return from the C call into a corresponding form that
     /// can be stored in Miri internal memory.
-    fn call_and_add_external_c_fct_to_context(
+    fn call_external_c_fct(
         &mut self,
         link_name: Symbol,
         dest: &PlaceTy<'tcx, Provenance>,
@@ -261,7 +601,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         for cur_arg in args.iter() {
             libffi_args.push(Self::scalar_to_carg(
                 this.read_scalar(cur_arg)?,
-                &cur_arg.layout.ty,
+                cur_arg.layout.ty,
                 this,
             )?);
         }
@@ -272,16 +612,31 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             .map(|cur_arg| cur_arg.arg_downcast())
             .collect::<Vec<libffi::high::Arg<'_>>>();
 
-        // Code pointer to C function.
-        // let ptr = CodePtr(*func.deref() as *mut _);
         // Call the function and store output, depending on return type in the function signature.
         self.call_external_c_and_store_return(link_name, dest, code_ptr, libffi_args)?;
+        // FIXME! ellen: get the `Wildcard` provenance propagation working.
+        // All exposed pointers now get marked with the `Wildcard` provenance.
+        // let this = self.eval_context_mut();
+        // let mut all_exposed = /* not implemented: */ intptrcast::GlobalStateInner::get_all_exposed(this);
+        // for (exp_id, exp_ptr) in all_exposed.iter() {
+        //     let (size, align, kind) = this.get_alloc_info(*exp_id);
+        //     if matches!(kind, AllocKind::LiveData) {
+        //         let alloc_ref = this.get_ptr_alloc((*exp_ptr).into(), size, align)?.unwrap();
+        //         let exp_alloc_mut = this.get_ptr_alloc_mut((*exp_ptr).into(), size, align)?;
+        //         exp_ptr.provenance = Provenance::Wildcard;
+        //         exp_alloc_mut.unwrap().write_ptr_sized(/*some offset*/, exp_ptr.into())?;
+        //     }
+        // }
         Ok(true)
     }
 }
 
 #[derive(Debug, Clone)]
 /// Enum of supported arguments to external C functions.
+// We introduce this enum instead of just calling `ffi::arg` and storing a list
+// of `libffi::high::Arg` directly, because the `libffi::high::Arg` just wraps a reference
+// to the value it represents: https://docs.rs/libffi/latest/libffi/high/call/struct.Arg.html
+// and we need to store a copy of the value, and pass a reference to this copy to C instead.
 pub enum CArg {
     /// 8-bit signed integer.
     Int8(i8),
@@ -321,43 +676,41 @@ pub enum CArg {
     ConstPtrUInt16(*const u16),
     ConstPtrUInt32(*const u32),
     ConstPtrUInt64(*const u64),
-    // recursive
-    RecConstPtrCarg(Box<CArg>),
-    RecMutPtrCarg(Box<CArg>),
+    /// Recursive `CArg` (for nested pointers).
+    RecCarg(Box<CArg>),
 }
 
 impl<'a> CArg {
     /// Convert a `CArg` to a `libffi` argument type.
     pub fn arg_downcast(&'a self) -> libffi::high::Arg<'a> {
         match self {
-            CArg::Int8(i) => arg(i),
-            CArg::Int16(i) => arg(i),
-            CArg::Int32(i) => arg(i),
-            CArg::Int64(i) => arg(i),
-            CArg::ISize(i) => arg(i),
-            CArg::UInt8(i) => arg(i),
-            CArg::UInt16(i) => arg(i),
-            CArg::UInt32(i) => arg(i),
-            CArg::UInt64(i) => arg(i),
-            CArg::USize(i) => arg(i),
-            CArg::MutPtrInt8(i) => arg(i),
-            CArg::MutPtrInt16(i) => arg(i),
-            CArg::MutPtrInt32(i) => arg(i),
-            CArg::MutPtrInt64(i) => arg(i),
-            CArg::MutPtrUInt8(i) => arg(i),
-            CArg::MutPtrUInt16(i) => arg(i),
-            CArg::MutPtrUInt32(i) => arg(i),
-            CArg::MutPtrUInt64(i) => arg(i),
-            CArg::ConstPtrInt8(i) => arg(i),
-            CArg::ConstPtrInt16(i) => arg(i),
-            CArg::ConstPtrInt32(i) => arg(i),
-            CArg::ConstPtrInt64(i) => arg(i),
-            CArg::ConstPtrUInt8(i) => arg(i),
-            CArg::ConstPtrUInt16(i) => arg(i),
-            CArg::ConstPtrUInt32(i) => arg(i),
-            CArg::ConstPtrUInt64(i) => arg(i),
-            CArg::RecConstPtrCarg(box_carg) => (*box_carg).arg_downcast(),
-            CArg::RecMutPtrCarg(box_carg) => (*box_carg).arg_downcast(),
+            CArg::Int8(i) => ffi::arg(i),
+            CArg::Int16(i) => ffi::arg(i),
+            CArg::Int32(i) => ffi::arg(i),
+            CArg::Int64(i) => ffi::arg(i),
+            CArg::ISize(i) => ffi::arg(i),
+            CArg::UInt8(i) => ffi::arg(i),
+            CArg::UInt16(i) => ffi::arg(i),
+            CArg::UInt32(i) => ffi::arg(i),
+            CArg::UInt64(i) => ffi::arg(i),
+            CArg::USize(i) => ffi::arg(i),
+            CArg::MutPtrInt8(i) => ffi::arg(i),
+            CArg::MutPtrInt16(i) => ffi::arg(i),
+            CArg::MutPtrInt32(i) => ffi::arg(i),
+            CArg::MutPtrInt64(i) => ffi::arg(i),
+            CArg::MutPtrUInt8(i) => ffi::arg(i),
+            CArg::MutPtrUInt16(i) => ffi::arg(i),
+            CArg::MutPtrUInt32(i) => ffi::arg(i),
+            CArg::MutPtrUInt64(i) => ffi::arg(i),
+            CArg::ConstPtrInt8(i) => ffi::arg(i),
+            CArg::ConstPtrInt16(i) => ffi::arg(i),
+            CArg::ConstPtrInt32(i) => ffi::arg(i),
+            CArg::ConstPtrInt64(i) => ffi::arg(i),
+            CArg::ConstPtrUInt8(i) => ffi::arg(i),
+            CArg::ConstPtrUInt16(i) => ffi::arg(i),
+            CArg::ConstPtrUInt32(i) => ffi::arg(i),
+            CArg::ConstPtrUInt64(i) => ffi::arg(i),
+            CArg::RecCarg(box_carg) => (*box_carg).arg_downcast(),
         }
     }
 }

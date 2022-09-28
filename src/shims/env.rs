@@ -18,11 +18,11 @@ fn windows_check_buffer_size((success, len): (bool, u64)) -> u32 {
     if success {
         // If the function succeeds, the return value is the number of characters stored in the target buffer,
         // not including the terminating null character.
-        u32::try_from(len).unwrap()
+        u32::try_from(len.checked_sub(1).unwrap()).unwrap()
     } else {
         // If the target buffer was not large enough to hold the data, the return value is the buffer size, in characters,
         // required to hold the string and its terminating null character.
-        u32::try_from(len.checked_add(1).unwrap()).unwrap()
+        u32::try_from(len).unwrap()
     }
 }
 
@@ -42,18 +42,19 @@ impl<'tcx> EnvVars<'tcx> {
         config: &MiriConfig,
     ) -> InterpResult<'tcx> {
         let target_os = ecx.tcx.sess.target.os.as_ref();
-        // HACK: Exclude `TERM` var to avoid terminfo trying to open the termcap file.
-        // This is (a) very slow and (b) does not work on Windows.
         let mut excluded_env_vars = config.excluded_env_vars.clone();
-        excluded_env_vars.push("TERM".to_owned());
+        if target_os == "windows" {
+            // HACK: Exclude `TERM` var to avoid terminfo trying to open the termcap file.
+            excluded_env_vars.push("TERM".to_owned());
+        }
 
         // Skip the loop entirely if we don't want to forward anything.
         if ecx.machine.communicate() || !config.forwarded_env_vars.is_empty() {
-            for (name, value) in env::vars_os() {
+            for (name, value) in &config.env {
                 // Always forward what is in `forwarded_env_vars`; that list can take precedence over excluded_env_vars.
-                let forward = config.forwarded_env_vars.iter().any(|v| **v == name)
+                let forward = config.forwarded_env_vars.iter().any(|v| **v == *name)
                     || (ecx.machine.communicate()
-                        && !excluded_env_vars.iter().any(|v| **v == name));
+                        && !excluded_env_vars.iter().any(|v| **v == *name));
                 if forward {
                     let var_ptr = match target_os {
                         target if target_os_is_unix(target) =>
@@ -65,7 +66,7 @@ impl<'tcx> EnvVars<'tcx> {
                                 unsupported
                             ),
                     };
-                    ecx.machine.env_vars.map.insert(name, var_ptr);
+                    ecx.machine.env_vars.map.insert(name.clone(), var_ptr);
                 }
             }
         }

@@ -4,6 +4,10 @@ int double_deref(const int **p) {
   return **p;
 }
 
+void deref_and_print(int *p) {
+  printf("deref in C has value: %d\n", *p);
+}
+
 int add_one_int(int x) {
   return 2 + x;
 }
@@ -29,3 +33,39 @@ short add_int16(short x) {
 long add_short_to_long(short x, long y) {
   return x + y;
 }
+
+int* pointer_test() {
+  int *point = malloc(sizeof(int)); 
+  *point=1;  
+  return point;
+}
+
+int* array_pointer_test() {
+  const int COUNT = 3;
+  int *arr = malloc(COUNT*sizeof(int));
+  for(int i = 0; i < COUNT; ++i) 
+    arr[i] = i;
+  return arr;
+}
+
+// examples of functions used for letting C write values and pointers to Miri memory,
+
+// double dereference pointers, and swap what values they're pointing to
+// note: this is only writing non-pointer values to memory
+void swap_double_ptrs(short **x, short **y) {
+    short temp = **x;
+    **x = **y;
+    **y = temp;
+}
+
+// the next functions were suggested by Ralf in
+// https://github.com/rust-lang/miri/issues/2365#issuecomment-1192512642
+
+// write non-pointer values to memory represented by pointers
+void set(short *x, short val) { *x = val; }
+void set2(short **x, short val) { **x = val; }
+
+// write pointer values to memory represented by pointers
+// NOTE: THESE FUNCTIONS ARE NOT PROPERLY SUPPORTED WITH MIRI YET
+void setptr(short **x, short *val) { *x = val; }
+void setptr2(short ***x, short *val) { **x = val; }

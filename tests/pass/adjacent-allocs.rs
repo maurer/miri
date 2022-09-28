@@ -1,6 +1,6 @@
 //@compile-flags: -Zmiri-permissive-provenance
 
-fn ensure_allocs_can_be_adjacent() {
+/*fn ensure_allocs_can_be_adjacent() {
     for _ in 0..512 {
         let n = 0u64;
         let ptr: *const u64 = &n;
@@ -8,12 +8,13 @@ fn ensure_allocs_can_be_adjacent() {
             let m = 0u64;
             &m as *const u64
         };
+        println!("{:?}", (ptr as i64)-(ptr2 as i64));
         if ptr.wrapping_add(1) == ptr2 {
             return;
         }
     }
     panic!("never saw adjacent stack variables?");
-}
+}*/
 
 fn test1() {
     // The slack between allocations is random.
@@ -57,7 +58,7 @@ fn test2() {
 }
 
 fn main() {
-    ensure_allocs_can_be_adjacent();
+//    ensure_allocs_can_be_adjacent();
     test1();
     test2();
 }

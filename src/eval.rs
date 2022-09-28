@@ -1,7 +1,6 @@
 //! Main evaluator loop and setting up the initial stack frame.
 
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::iter;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -9,6 +8,7 @@ use std::thread;
 
 use log::info;
 
+use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     self,
@@ -73,6 +73,9 @@ pub enum BacktraceStyle {
 /// Configuration needed to spawn a Miri instance.
 #[derive(Clone)]
 pub struct MiriConfig {
+    /// The host environment snapshot to use as basis for what is provided to the interpreted program.
+    /// (This is still subject to isolation as well as `excluded_env_vars` and `forwarded_env_vars`.)
+    pub env: Vec<(OsString, OsString)>,
     /// Determine if validity checking is enabled.
     pub validate: bool,
     /// Determines if Stacked Borrows is enabled.
@@ -94,11 +97,11 @@ pub struct MiriConfig {
     /// The seed to use when non-determinism or randomness are required (e.g. ptr-to-int cast, `getrandom()`).
     pub seed: Option<u64>,
     /// The stacked borrows pointer ids to report about
-    pub tracked_pointer_tags: HashSet<SbTag>,
+    pub tracked_pointer_tags: FxHashSet<SbTag>,
     /// The stacked borrows call IDs to report about
-    pub tracked_call_ids: HashSet<CallId>,
+    pub tracked_call_ids: FxHashSet<CallId>,
     /// The allocation ids to report about.
-    pub tracked_alloc_ids: HashSet<AllocId>,
+    pub tracked_alloc_ids: FxHashSet<AllocId>,
     /// Determine if data race detection should be enabled
     pub data_race_detector: bool,
     /// Determine if weak memory emulation should be enabled. Requires data race detection to be enabled
@@ -127,13 +130,16 @@ pub struct MiriConfig {
     /// Whether Stacked Borrows retagging should recurse into fields of datatypes.
     pub retag_fields: bool,
     /// The location of a shared object file to load when calling external functions
-    /// TODO! consider allowing users to specify paths to multiple SO files, or to a directory
+    /// FIXME! consider allowing users to specify paths to multiple SO files, or to a directory
     pub external_so_file: Option<PathBuf>,
+    /// Run a garbage collector for SbTags every N basic blocks.
+    pub gc_interval: u32,
 }
 
 impl Default for MiriConfig {
     fn default() -> MiriConfig {
         MiriConfig {
+            env: vec![],
             validate: true,
             stacked_borrows: true,
             check_alignment: AlignmentCheck::Int,
@@ -144,9 +150,9 @@ impl Default for MiriConfig {
             forwarded_env_vars: vec![],
             args: vec![],
             seed: None,
-            tracked_pointer_tags: HashSet::default(),
-            tracked_call_ids: HashSet::default(),
-            tracked_alloc_ids: HashSet::default(),
+            tracked_pointer_tags: FxHashSet::default(),
+            tracked_call_ids: FxHashSet::default(),
+            tracked_alloc_ids: FxHashSet::default(),
             data_race_detector: true,
             weak_memory_emulation: true,
             track_outdated_loads: false,
@@ -160,6 +166,7 @@ impl Default for MiriConfig {
             report_progress: None,
             retag_fields: false,
             external_so_file: None,
+            gc_interval: 10_000,
         }
     }
 }
@@ -251,7 +258,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
         }
         // Store command line as UTF-16 for Windows `GetCommandLineW`.
         {
-            // Construct a command string with all the aguments.
+            // Construct a command string with all the arguments.
             let cmd_utf16: Vec<u16> = args_to_utf16_command_string(config.args.iter());
 
             let cmd_type = tcx.mk_array(tcx.types.u16, u64::try_from(cmd_utf16.len()).unwrap());
@@ -273,7 +280,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
     // Call start function.
 
     match entry_type {
-        EntryFnType::Main => {
+        EntryFnType::Main { .. } => {
             let start_id = tcx.lang_items().start_fn().unwrap();
             let main_ret_ty = tcx.fn_sig(entry_id).output();
             let main_ret_ty = main_ret_ty.no_bound_vars().unwrap();
@@ -288,10 +295,17 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
 
             let main_ptr = ecx.create_fn_alloc_ptr(FnVal::Instance(entry_instance));
 
+            let sigpipe = 2; // Inlining of `DEFAULT` from https://github.com/rust-lang/rust/blob/master/compiler/rustc_session/src/config/sigpipe.rs
+
             ecx.call_function(
                 start_instance,
                 Abi::Rust,
-                &[Scalar::from_pointer(main_ptr, &ecx).into(), argc.into(), argv],
+                &[
+                    Scalar::from_pointer(main_ptr, &ecx).into(),
+                    argc.into(),
+                    argv,
+                    Scalar::from_u8(sigpipe).into(),
+                ],
                 Some(&ret_place.into()),
                 StackPopCleanup::Root { cleanup: true },
             )?;
@@ -316,7 +330,8 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
 
 /// Evaluates the entry function specified by `entry_id`.
 /// Returns `Some(return_code)` if program executed completed.
-/// Returns `None` if an evaluation error occured.
+/// Returns `None` if an evaluation error occurred.
+#[allow(clippy::needless_lifetimes)]
 pub fn eval_entry<'tcx>(
     tcx: TyCtxt<'tcx>,
     entry_id: DefId,
@@ -372,10 +387,13 @@ pub fn eval_entry<'tcx>(
     });
 
     // Machine cleanup. Only do this if all threads have terminated; threads that are still running
-    // might cause data races (https://github.com/rust-lang/miri/issues/2020) or Stacked Borrows
-    // errors (https://github.com/rust-lang/miri/issues/2396) if we deallocate here.
+    // might cause Stacked Borrows errors (https://github.com/rust-lang/miri/issues/2396).
     if ecx.have_all_terminated() {
-        EnvVars::cleanup(&mut ecx).unwrap();
+        // Even if all threads have terminated, we have to beware of data races since some threads
+        // might not have joined the main thread (https://github.com/rust-lang/miri/issues/2020,
+        // https://github.com/rust-lang/miri/issues/2508).
+        ecx.allow_data_races_all_threads_done();
+        EnvVars::cleanup(&mut ecx).expect("error during env var cleanup");
     }
 
     // Process the result.

@@ -171,18 +171,18 @@ to `.vscode/settings.json` in your local Miri clone:
         "env",
         "MIRI_AUTO_OPS=no",
         "./miri",
-        "check",
+        "cargo",
+        "clippy", // make this `check` when working with a locally built rustc
         "--message-format=json"
     ],
-    "rust-analyzer.buildScripts.overrideCommand": [
+    // Contrary to what the name suggests, this also affects proc macros.
+    "rust-analyzer.cargo.buildScripts.overrideCommand": [
         "env",
         "MIRI_AUTO_OPS=no",
         "./miri",
+        "cargo",
         "check",
         "--message-format=json",
-    ],
-    "rust-analyzer.rustfmt.extraArgs": [
-        "+nightly"
     ],
 }
 ```

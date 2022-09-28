@@ -1,4 +1,4 @@
-use crate::thread::Time;
+use crate::concurrency::thread::Time;
 use crate::*;
 use rustc_target::abi::{Align, Size};
 use std::time::{Instant, SystemTime};
@@ -33,7 +33,7 @@ pub fn futex<'tcx>(
     let val = this.read_scalar(&args[2])?.to_i32()?;
 
     let thread = this.get_active_thread();
-    let addr_scalar = addr.to_scalar()?;
+    let addr_scalar = addr.to_scalar();
     let addr_usize = addr_scalar.to_machine_usize(this)?;
 
     let futex_private = this.eval_libc_i32("FUTEX_PRIVATE_FLAG")?;
@@ -169,7 +169,7 @@ pub fn futex<'tcx>(
             //
             // Thankfully, preemptions cannot happen inside a Miri shim, so we do not need to
             // do anything special to guarantee fence-load-comparison atomicity.
-            this.validate_atomic_fence(AtomicFenceOrd::SeqCst)?;
+            this.atomic_fence(AtomicFenceOrd::SeqCst)?;
             // Read an `i32` through the pointer, regardless of any wrapper types.
             // It's not uncommon for `addr` to be passed as another type than `*mut i32`, such as `*const AtomicI32`.
             let futex_val = this
@@ -240,8 +240,9 @@ pub fn futex<'tcx>(
             // Together with the SeqCst fence in futex_wait, this makes sure that futex_wait
             // will see the latest value on addr which could be changed by our caller
             // before doing the syscall.
-            this.validate_atomic_fence(AtomicFenceOrd::SeqCst)?;
+            this.atomic_fence(AtomicFenceOrd::SeqCst)?;
             let mut n = 0;
+            #[allow(clippy::integer_arithmetic)]
             for _ in 0..val {
                 if let Some(thread) = this.futex_wake(addr_usize, bitset) {
                     this.unblock_thread(thread);

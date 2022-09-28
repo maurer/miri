@@ -5,11 +5,13 @@ use rustc_target::spec::abi::Abi;
 use log::trace;
 
 use crate::helpers::check_arg_count;
+use crate::shims::windows::handle::{EvalContextExt as _, Handle, PseudoHandle};
 use crate::*;
 
 #[derive(Debug, Copy, Clone)]
 pub enum Dlsym {
     NtWriteFile,
+    SetThreadDescription,
 }
 
 impl Dlsym {
@@ -18,8 +20,8 @@ impl Dlsym {
     pub fn from_str<'tcx>(name: &str) -> InterpResult<'tcx, Option<Dlsym>> {
         Ok(match name {
             "GetSystemTimePreciseAsFileTime" => None,
-            "SetThreadDescription" => None,
             "NtWriteFile" => Some(Dlsym::NtWriteFile),
+            "SetThreadDescription" => Some(Dlsym::SetThreadDescription),
             _ => throw_unsup_format!("unsupported Windows dlsym: {}", name),
         })
     }
@@ -45,7 +47,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             Dlsym::NtWriteFile => {
                 if !this.frame_in_std() {
                     throw_unsup_format!(
-                        "NtWriteFile support is crude and just enough for stdout to work"
+                        "`NtWriteFile` support is crude and just enough for stdout to work"
                     );
                 }
 
@@ -68,7 +70,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
                 if byte_offset != 0 {
                     throw_unsup_format!(
-                        "NtWriteFile ByteOffset paremeter is non-null, which is unsupported"
+                        "`NtWriteFile` `ByteOffset` paremeter is non-null, which is unsupported"
                     );
                 }
 
@@ -76,7 +78,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     // stdout/stderr
                     use std::io::{self, Write};
 
-                    let buf_cont = this.read_bytes_ptr(buf, Size::from_bytes(u64::from(n)))?;
+                    let buf_cont =
+                        this.read_bytes_ptr_strip_provenance(buf, Size::from_bytes(u64::from(n)))?;
                     let res = if this.machine.mute_stdout_stderr {
                         Ok(buf_cont.len())
                     } else if handle == -11 {
@@ -106,6 +109,23 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     Scalar::from_u32(if written.is_some() { 0 } else { 0xC0000185u32 }),
                     dest,
                 )?;
+            }
+            Dlsym::SetThreadDescription => {
+                let [handle, name] = check_arg_count(args)?;
+
+                let handle = this.read_scalar(handle)?;
+
+                let name = this.read_wide_str(this.read_pointer(name)?)?;
+
+                let thread = match Handle::from_scalar(handle, this)? {
+                    Some(Handle::Thread(thread)) => thread,
+                    Some(Handle::Pseudo(PseudoHandle::CurrentThread)) => this.get_active_thread(),
+                    _ => this.invalid_handle("SetThreadDescription")?,
+                };
+
+                this.set_thread_name_wide(thread, &name);
+
+                this.write_null(dest)?;
             }
         }
 

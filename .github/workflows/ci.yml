@@ -34,6 +34,10 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Set the tag GC interval to 1 on linux
+        if: runner.os == 'Linux'
+        run: echo "MIRIFLAGS=-Zmiri-tag-gc=1" >> $GITHUB_ENV
+
       # We install gnu-tar because BSD tar is buggy on macOS builders of GHA.
       # See <https://github.com/actions/cache/issues/403>.
       - name: Install GNU tar
@@ -58,7 +62,7 @@ jobs:
             # contains package information of crates installed via `cargo install`.
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'cargo-miri/version.rs') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'cargo-miri/src/version.rs') }}
           restore-keys: ${{ runner.os }}-cargo
 
       - name: Install rustup-toolchain-install-master and xargo
@@ -142,7 +146,7 @@ jobs:
           ZULIP_API_TOKEN: ${{ secrets.ZULIP_API_TOKEN }}
         run: |
           ~/.local/bin/zulip-send --stream miri --subject "Cron Job Failure (miri, $(date -u +%Y-%m))" \
-            --message 'Dear @**RalfJ** and @**oli**
+            --message 'Dear @*T-miri*,
 
           It would appear that the Miri cron job build failed. Would you mind investigating this issue?
 

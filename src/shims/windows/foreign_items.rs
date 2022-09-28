@@ -6,7 +6,10 @@ use rustc_target::spec::abi::Abi;
 
 use crate::*;
 use shims::foreign_items::EmulateByNameResult;
+use shims::windows::handle::{EvalContextExt as _, Handle, PseudoHandle};
 use shims::windows::sync::EvalContextExt as _;
+use shims::windows::thread::EvalContextExt as _;
+
 use smallvec::SmallVec;
 
 impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriEvalContext<'mir, 'tcx> {}
@@ -19,6 +22,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         dest: &PlaceTy<'tcx, Provenance>,
     ) -> InterpResult<'tcx, EmulateByNameResult<'mir, 'tcx>> {
         let this = self.eval_context_mut();
+
+        // See `fn emulate_foreign_item_by_name` in `shims/foreign_items.rs` for the general pattern.
 
         // Windows API stubs.
         // HANDLE = isize
@@ -99,7 +104,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             "SetLastError" => {
                 let [error] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                let error = this.read_scalar(error)?.check_init()?;
+                let error = this.read_scalar(error)?;
                 this.set_last_error(error)?;
             }
             "GetLastError" => {
@@ -110,6 +115,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
             // Querying system information
             "GetSystemInfo" => {
+                // Also called from `page_size` crate.
                 let [system_info] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let system_info = this.deref_operand(system_info)?;
@@ -181,7 +187,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let key = u128::from(this.read_scalar(key)?.to_u32()?);
                 let active_thread = this.get_active_thread();
-                let new_data = this.read_scalar(new_ptr)?.check_init()?;
+                let new_data = this.read_scalar(new_ptr)?;
                 this.machine.tls.store_tls(key, active_thread, new_data, &*this.tcx)?;
 
                 // Return success (`1`).
@@ -217,6 +223,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let result = this.QueryPerformanceFrequency(lpFrequency)?;
                 this.write_scalar(Scalar::from_i32(result), dest)?;
+            }
+            "Sleep" => {
+                let [timeout] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                this.Sleep(timeout)?;
             }
 
             // Synchronization primitives
@@ -276,19 +288,32 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let [algorithm, ptr, len, flags] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let algorithm = this.read_scalar(algorithm)?;
+                let algorithm = algorithm.to_machine_usize(this)?;
                 let ptr = this.read_pointer(ptr)?;
                 let len = this.read_scalar(len)?.to_u32()?;
                 let flags = this.read_scalar(flags)?.to_u32()?;
-                if flags != 2 {
-                    //      ^ BCRYPT_USE_SYSTEM_PREFERRED_RNG
-                    throw_unsup_format!(
-                        "BCryptGenRandom is supported only with the BCRYPT_USE_SYSTEM_PREFERRED_RNG flag"
-                    );
-                }
-                if algorithm.to_machine_usize(this)? != 0 {
-                    throw_unsup_format!(
-                        "BCryptGenRandom algorithm must be NULL when the flag is BCRYPT_USE_SYSTEM_PREFERRED_RNG"
-                    );
+                match flags {
+                    0 => {
+                        // BCRYPT_RNG_ALG_HANDLE
+                        if algorithm != 0x81 {
+                            throw_unsup_format!(
+                                "BCryptGenRandom algorithm must be BCRYPT_RNG_ALG_HANDLE when the flag is 0"
+                            );
+                        }
+                    }
+                    2 => {
+                        // BCRYPT_USE_SYSTEM_PREFERRED_RNG
+                        if algorithm != 0 {
+                            throw_unsup_format!(
+                                "BCryptGenRandom algorithm must be NULL when the flag is BCRYPT_USE_SYSTEM_PREFERRED_RNG"
+                            );
+                        }
+                    }
+                    _ => {
+                        throw_unsup_format!(
+                            "BCryptGenRandom is only supported with BCRYPT_USE_SYSTEM_PREFERRED_RNG or BCRYPT_RNG_ALG_HANDLE"
+                        );
+                    }
                 }
                 this.gen_random(ptr, len.into())?;
                 this.write_null(dest)?; // STATUS_SUCCESS
@@ -313,12 +338,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // FIXME: we should set last_error, but to what?
                 this.write_null(dest)?;
             }
-            "SwitchToThread" => {
-                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                // Note that once Miri supports concurrency, this will need to return a nonzero
-                // value if this call does result in switching to another thread.
-                this.write_null(dest)?;
-            }
             "GetStdHandle" => {
                 let [which] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
@@ -326,16 +345,42 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // We just make this the identity function, so we know later in `NtWriteFile` which
                 // one it is. This is very fake, but libtest needs it so we cannot make it a
                 // std-only shim.
+                // FIXME: this should return real HANDLEs when io support is added
                 this.write_scalar(Scalar::from_machine_isize(which.into(), this), dest)?;
             }
-
-            // Better error for attempts to create a thread
-            "CreateThread" => {
-                let [_, _, _, _, _, _] =
+            "CloseHandle" => {
+                let [handle] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
 
-                this.handle_unsupported("can't create threads on Windows")?;
-                return Ok(EmulateByNameResult::AlreadyJumped);
+                this.CloseHandle(handle)?;
+
+                this.write_scalar(Scalar::from_u32(1), dest)?;
+            }
+
+            // Threading
+            "CreateThread" => {
+                let [security, stacksize, start, arg, flags, thread] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                let thread_id =
+                    this.CreateThread(security, stacksize, start, arg, flags, thread)?;
+
+                this.write_scalar(Handle::Thread(thread_id).to_scalar(this), dest)?;
+            }
+            "WaitForSingleObject" => {
+                let [handle, timeout] =
+                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                let ret = this.WaitForSingleObject(handle, timeout)?;
+                this.write_scalar(Scalar::from_u32(ret), dest)?;
+            }
+            "GetCurrentThread" => {
+                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                this.write_scalar(
+                    Handle::Pseudo(PseudoHandle::CurrentThread).to_scalar(this),
+                    dest,
+                )?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
@@ -343,6 +388,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             "GetProcessHeap" if this.frame_in_std() => {
                 let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 // Just fake a HANDLE
+                // It's fine to not use the Handle type here because its a stub
                 this.write_scalar(Scalar::from_machine_isize(1, this), dest)?;
             }
             "GetModuleHandleA" if this.frame_in_std() => {
@@ -373,44 +419,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 // Any non zero value works for the stdlib. This is just used for stack overflows anyway.
                 this.write_scalar(Scalar::from_u32(1), dest)?;
             }
-            | "InitializeCriticalSection"
-            | "EnterCriticalSection"
-            | "LeaveCriticalSection"
-            | "DeleteCriticalSection"
-                if this.frame_in_std() =>
-            {
-                #[allow(non_snake_case)]
-                let [_lpCriticalSection] =
-                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                assert_eq!(
-                    this.get_total_thread_count(),
-                    1,
-                    "concurrency on Windows is not supported"
-                );
-                // Nothing to do, not even a return value.
-                // (Windows locks are reentrant, and we have only 1 thread,
-                // so not doing any futher checks here is at least not incorrect.)
-            }
-            "TryEnterCriticalSection" if this.frame_in_std() => {
-                #[allow(non_snake_case)]
-                let [_lpCriticalSection] =
-                    this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                assert_eq!(
-                    this.get_total_thread_count(),
-                    1,
-                    "concurrency on Windows is not supported"
-                );
-                // There is only one thread, so this always succeeds and returns TRUE.
-                this.write_scalar(Scalar::from_i32(1), dest)?;
-            }
-            "GetCurrentThread" if this.frame_in_std() => {
-                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.write_scalar(Scalar::from_machine_isize(1, this), dest)?;
-            }
             "GetCurrentProcessId" if this.frame_in_std() => {
                 let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let result = this.GetCurrentProcessId()?;
                 this.write_scalar(Scalar::from_u32(result), dest)?;
+            }
+            // this is only callable from std because we know that std ignores the return value
+            "SwitchToThread" if this.frame_in_std() => {
+                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+
+                this.yield_active_thread();
+
+                // FIXME: this should return a nonzero value if this call does result in switching to another thread.
+                this.write_null(dest)?;
             }
 
             _ => return Ok(EmulateByNameResult::NotSupported),
